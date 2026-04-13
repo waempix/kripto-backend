@@ -1,25 +1,39 @@
-import os, time
+import os, time, hmac, hashlib
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from binance.client import Client
-from binance.exceptions import BinanceAPIException
+import urllib.request, urllib.parse, json
 
 API_KEY    = os.environ.get("BINANCE_API_KEY", "")
 API_SECRET = os.environ.get("BINANCE_API_SECRET", "")
+BASE       = "https://api.binance.com"
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET"], allow_headers=["*"])
 
-def get_client():
-    if not API_KEY or not API_SECRET:
+def sign(params):
+    ts  = int(time.time() * 1000)
+    params["timestamp"]  = ts
+    params["recvWindow"] = 10000
+    q   = urllib.parse.urlencode(params)
+    sig = hmac.new(API_SECRET.encode(), q.encode(), hashlib.sha256).hexdigest()
+    return q + "&signature=" + sig
+
+def get(path, params=None, signed=False):
+    if not API_KEY:
         raise HTTPException(status_code=400, detail="API key eksik")
-    c = Client(API_KEY, API_SECRET)
+    p = params or {}
+    if signed:
+        q = sign(p)
+    else:
+        q = urllib.parse.urlencode(p)
+    url = BASE + path + ("?" + q if q else "")
+    req = urllib.request.Request(url, headers={"X-MBX-APIKEY": API_KEY})
     try:
-        s = c.get_server_time()["serverTime"]
-        c.timestamp_offset = s - int(time.time() * 1000)
-    except:
-        pass
-    return c
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        body = json.loads(e.read().decode("utf-8"))
+        raise HTTPException(status_code=e.code, detail=body.get("msg", str(e)))
 
 @app.get("/api/ping")
 def ping():
@@ -28,11 +42,11 @@ def ping():
 @app.get("/api/portfolio")
 def portfolio():
     try:
-        c   = get_client()
-        acc = c.get_account()
-        px  = {p["symbol"]: float(p["price"]) for p in c.get_all_tickers()}
+        account = get("/api/v3/account", signed=True)
+        tickers = get("/api/v3/ticker/price")
+        px = {t["symbol"]: float(t["price"]) for t in tickers}
         res, tot = [], 0.0
-        for b in acc["balances"]:
+        for b in account["balances"]:
             amt = float(b["free"]) + float(b["locked"])
             if amt <= 0:
                 continue
@@ -53,16 +67,15 @@ def portfolio():
             })
         res.sort(key=lambda x: x["usdtValue"], reverse=True)
         return {"success": True, "portfolio": res, "totalUsdt": round(tot, 2)}
-    except BinanceAPIException as e:
-        raise HTTPException(status_code=400, detail=str(e.message))
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/trades/{symbol}")
 def trades(symbol: str):
     try:
-        c  = get_client()
-        ts = c.get_my_trades(symbol=symbol.upper() + "USDT", limit=20)
+        ts = get("/api/v3/myTrades", {"symbol": symbol.upper() + "USDT", "limit": 20}, signed=True)
         return {
             "success": True,
             "trades": [
@@ -78,14 +91,15 @@ def trades(symbol: str):
                 for t in ts
             ]
         }
-    except BinanceAPIException as e:
-        raise HTTPException(status_code=400, detail=str(e.message))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/open-orders")
 def open_orders():
     try:
-        c = get_client()
-        orders = c.get_open_orders()
+        orders = get("/api/v3/openOrders", signed=True)
         return {
             "success": True,
             "orders": [
@@ -99,5 +113,7 @@ def open_orders():
                 for o in orders
             ]
         }
-    except BinanceAPIException as e:
-        raise HTTPException(status_code=400, detail=str(e.message))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
