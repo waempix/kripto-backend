@@ -1,119 +1,207 @@
-import os, time, hmac, hashlib
+import os, time, hmac, hashlib, json
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-import urllib.request, urllib.parse, json
+from pydantic import BaseModel
+import urllib.request, urllib.parse
 
-API_KEY    = os.environ.get("BINANCE_API_KEY", "")
-API_SECRET = os.environ.get("BINANCE_API_SECRET", "")
-BASE       = "https://api.binance.com"
+# Okuma key (bakiye görme)
+READ_KEY    = os.environ.get("BINANCE_API_KEY", "")
+READ_SECRET = os.environ.get("BINANCE_API_SECRET", "")
+
+# Trading key (emir gönderme)
+TRADE_KEY    = os.environ.get("BINANCE_TRADE_KEY", "")
+TRADE_SECRET = os.environ.get("BINANCE_TRADE_SECRET", "")
+
+BASE         = "https://api.binance.com"
+FUTURES_BASE = "https://fapi.binance.com"
 
 app = FastAPI()
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-def sign(params):
-    ts  = int(time.time() * 1000)
+# ── İmza ──────────────────────────────────────────────────────────────────────
+def sign(params, secret):
+    ts = int(time.time() * 1000)
     params["timestamp"]  = ts
     params["recvWindow"] = 10000
     q   = urllib.parse.urlencode(params)
-    sig = hmac.new(API_SECRET.encode(), q.encode(), hashlib.sha256).hexdigest()
+    sig = hmac.new(secret.encode(), q.encode(), hashlib.sha256).hexdigest()
     return q + "&signature=" + sig
 
-def get(path, params=None, signed=False):
-    if not API_KEY:
-        raise HTTPException(status_code=400, detail="API key eksik")
-    p = params or {}
-    if signed:
-        q = sign(p)
-    else:
-        q = urllib.parse.urlencode(p)
-    url = BASE + path + ("?" + q if q else "")
-    req = urllib.request.Request(url, headers={"X-MBX-APIKEY": API_KEY})
+def req(base, path, params, key, secret, method="GET"):
+    q   = sign(params, secret)
+    url = base + path + "?" + q
+    r   = urllib.request.Request(url, headers={"X-MBX-APIKEY": key})
+    r.method = method
+    if method == "POST":
+        r.data = q.encode()
+        r.add_header("Content-Type", "application/x-www-form-urlencoded")
+        r = urllib.request.Request(base + path, data=q.encode(),
+            headers={"X-MBX-APIKEY": key, "Content-Type": "application/x-www-form-urlencoded"})
     try:
-        with urllib.request.urlopen(req, timeout=20) as r:
-            return json.loads(r.read().decode("utf-8"))
+        with urllib.request.urlopen(r, timeout=20) as res:
+            return json.loads(res.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         body = json.loads(e.read().decode("utf-8"))
         raise HTTPException(status_code=e.code, detail=body.get("msg", str(e)))
 
+def get_pub(path, params=None):
+    q   = urllib.parse.urlencode(params or {})
+    url = BASE + path + ("?" + q if q else "")
+    with urllib.request.urlopen(url, timeout=15) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+# ── Okuma endpoint'leri ───────────────────────────────────────────────────────
 @app.get("/api/ping")
-def ping():
-    return {"status": "ok"}
+def ping(): return {"status": "ok"}
 
 @app.get("/api/portfolio")
 def portfolio():
     try:
-        account = get("/api/v3/account", signed=True)
-        tickers = get("/api/v3/ticker/price")
+        account = req(BASE, "/api/v3/account", {}, READ_KEY, READ_SECRET)
+        tickers = get_pub("/api/v3/ticker/price")
         px = {t["symbol"]: float(t["price"]) for t in tickers}
         res, tot = [], 0.0
         for b in account["balances"]:
             amt = float(b["free"]) + float(b["locked"])
-            if amt <= 0:
-                continue
+            if amt <= 0: continue
             a = b["asset"]
-            u = 0.0
-            if a == "USDT":
-                u = amt
-            elif a + "USDT" in px:
-                u = amt * px[a + "USDT"]
-            elif a + "BTC" in px and "BTCUSDT" in px:
-                u = amt * px[a + "BTC"] * px["BTCUSDT"]
+            u = amt if a=="USDT" else amt*px.get(a+"USDT",0) or amt*px.get(a+"BTC",0)*px.get("BTCUSDT",1)
             tot += u
-            res.append({
-                "coin":      a,
-                "amount":    round(amt, 8),
-                "usdtValue": round(u, 2),
-                "price":     round(px.get(a + "USDT", 0), 6)
-            })
+            res.append({"coin":a,"amount":round(amt,8),"usdtValue":round(u,2),"price":round(px.get(a+"USDT",0),6)})
         res.sort(key=lambda x: x["usdtValue"], reverse=True)
-        return {"success": True, "portfolio": res, "totalUsdt": round(tot, 2)}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return {"success":True,"portfolio":res,"totalUsdt":round(tot,2)}
+    except HTTPException: raise
+    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/trades/{symbol}")
 def trades(symbol: str):
     try:
-        ts = get("/api/v3/myTrades", {"symbol": symbol.upper() + "USDT", "limit": 20}, signed=True)
-        return {
-            "success": True,
-            "trades": [
-                {
-                    "time":    t["time"],
-                    "side":    "AL" if t["isBuyer"] else "SAT",
-                    "price":   float(t["price"]),
-                    "qty":     float(t["qty"]),
-                    "total":   round(float(t["price"]) * float(t["qty"]), 2),
-                    "fee":     float(t["commission"]),
-                    "feeCoin": t["commissionAsset"]
-                }
-                for t in ts
-            ]
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        ts = req(BASE, "/api/v3/myTrades", {"symbol":symbol.upper()+"USDT","limit":20}, READ_KEY, READ_SECRET)
+        return {"success":True,"trades":[{"time":t["time"],"side":"AL" if t["isBuyer"] else "SAT","price":float(t["price"]),"qty":float(t["qty"]),"total":round(float(t["price"])*float(t["qty"]),2),"fee":float(t["commission"]),"feeCoin":t["commissionAsset"]} for t in ts]}
+    except HTTPException: raise
+    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/open-orders")
 def open_orders():
     try:
-        orders = get("/api/v3/openOrders", signed=True)
-        return {
-            "success": True,
-            "orders": [
-                {
-                    "symbol": o["symbol"],
-                    "side":   "AL" if o["side"] == "BUY" else "SAT",
-                    "price":  float(o["price"]),
-                    "qty":    float(o["origQty"]),
-                    "status": o["status"]
-                }
-                for o in orders
-            ]
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        orders = req(BASE, "/api/v3/openOrders", {}, READ_KEY, READ_SECRET)
+        return {"success":True,"orders":[{"symbol":o["symbol"],"side":"AL" if o["side"]=="BUY" else "SAT","price":float(o["price"]),"qty":float(o["origQty"]),"status":o["status"]} for o in orders]}
+    except HTTPException: raise
+    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
+
+# ── Futures bakiye ve pozisyonlar ─────────────────────────────────────────────
+@app.get("/api/futures/balance")
+def futures_balance():
+    try:
+        balances = req(FUTURES_BASE, "/fapi/v2/balance", {}, TRADE_KEY, TRADE_SECRET)
+        usdt = next((b for b in balances if b["asset"]=="USDT"), None)
+        if not usdt: return {"success":True,"balance":0,"availableBalance":0}
+        return {"success":True,"balance":round(float(usdt["balance"]),2),"availableBalance":round(float(usdt["availableBalance"]),2)}
+    except HTTPException: raise
+    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/futures/positions")
+def futures_positions():
+    try:
+        positions = req(FUTURES_BASE, "/fapi/v2/positionRisk", {}, TRADE_KEY, TRADE_SECRET)
+        active = [p for p in positions if float(p["positionAmt"]) != 0]
+        result = []
+        for p in active:
+            amt    = float(p["positionAmt"])
+            entry  = float(p["entryPrice"])
+            mark   = float(p["markPrice"])
+            pnl    = float(p["unRealizedProfit"])
+            lev    = int(p["leverage"])
+            side   = "LONG" if amt > 0 else "SHORT"
+            pct    = (pnl / (abs(amt) * entry / lev)) * 100 if entry > 0 else 0
+            result.append({"symbol":p["symbol"],"side":side,"size":round(abs(amt),4),"entry":round(entry,4),"mark":round(mark,4),"pnl":round(pnl,2),"pnlPct":round(pct,2),"leverage":lev,"liquidation":round(float(p["liquidationPrice"]),4)})
+        return {"success":True,"positions":result}
+    except HTTPException: raise
+    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
+
+# ── Emir modelleri ────────────────────────────────────────────────────────────
+class SpotOrder(BaseModel):
+    symbol:   str
+    side:     str   # BUY veya SELL
+    quantity: float
+    orderType: str = "MARKET"
+    price:    float = 0.0
+
+class FuturesOrder(BaseModel):
+    symbol:     str
+    side:       str    # BUY veya SELL
+    quantity:   float
+    leverage:   int = 5
+    orderType:  str = "MARKET"
+    price:      float = 0.0
+    stopLoss:   float = 0.0
+    takeProfit: float = 0.0
+
+# ── Spot Emir ─────────────────────────────────────────────────────────────────
+@app.post("/api/order/spot")
+def spot_order(order: SpotOrder):
+    if not TRADE_KEY:
+        raise HTTPException(status_code=400, detail="Trading key eksik")
+    try:
+        sym = order.symbol.upper() + "USDT"
+        params = {"symbol":sym,"side":order.side.upper(),"type":order.orderType.upper(),"quantity":order.quantity}
+        if order.orderType.upper() == "LIMIT":
+            params["price"]    = order.price
+            params["timeInForce"] = "GTC"
+        result = req(BASE, "/api/v3/order", params, TRADE_KEY, TRADE_SECRET, "POST")
+        return {"success":True,"orderId":result["orderId"],"symbol":sym,"side":order.side,"qty":order.quantity,"status":result["status"]}
+    except HTTPException: raise
+    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
+
+# ── Futures Emir ──────────────────────────────────────────────────────────────
+@app.post("/api/futures/order")
+def futures_order(order: FuturesOrder):
+    if not TRADE_KEY:
+        raise HTTPException(status_code=400, detail="Trading key eksik")
+    try:
+        sym = order.symbol.upper() + "USDT"
+
+        # Kaldıraç ayarla
+        req(FUTURES_BASE, "/fapi/v1/leverage", {"symbol":sym,"leverage":order.leverage}, TRADE_KEY, TRADE_SECRET, "POST")
+
+        # Ana emir
+        params = {"symbol":sym,"side":order.side.upper(),"type":order.orderType.upper(),"quantity":order.quantity}
+        if order.orderType.upper() == "LIMIT":
+            params["price"]       = order.price
+            params["timeInForce"] = "GTC"
+        result = req(FUTURES_BASE, "/fapi/v1/order", params, TRADE_KEY, TRADE_SECRET, "POST")
+
+        orders = [{"orderId":result["orderId"],"type":"Ana Emir","status":result["status"]}]
+
+        # Stop-loss
+        if order.stopLoss > 0:
+            sl_side = "SELL" if order.side.upper()=="BUY" else "BUY"
+            sl = req(FUTURES_BASE, "/fapi/v1/order", {"symbol":sym,"side":sl_side,"type":"STOP_MARKET","stopPrice":order.stopLoss,"closePosition":"true"}, TRADE_KEY, TRADE_SECRET, "POST")
+            orders.append({"orderId":sl["orderId"],"type":"Stop-Loss","status":sl["status"]})
+
+        # Take-profit
+        if order.takeProfit > 0:
+            tp_side = "SELL" if order.side.upper()=="BUY" else "BUY"
+            tp = req(FUTURES_BASE, "/fapi/v1/order", {"symbol":sym,"side":tp_side,"type":"TAKE_PROFIT_MARKET","stopPrice":order.takeProfit,"closePosition":"true"}, TRADE_KEY, TRADE_SECRET, "POST")
+            orders.append({"orderId":tp["orderId"],"type":"Take-Profit","status":tp["status"]})
+
+        return {"success":True,"symbol":sym,"side":order.side,"leverage":order.leverage,"qty":order.quantity,"orders":orders}
+    except HTTPException: raise
+    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
+
+# ── Pozisyon kapat ────────────────────────────────────────────────────────────
+@app.post("/api/futures/close/{symbol}")
+def close_position(symbol: str):
+    if not TRADE_KEY:
+        raise HTTPException(status_code=400, detail="Trading key eksik")
+    try:
+        sym = symbol.upper() + "USDT"
+        positions = req(FUTURES_BASE, "/fapi/v2/positionRisk", {}, TRADE_KEY, TRADE_SECRET)
+        pos = next((p for p in positions if p["symbol"]==sym and float(p["positionAmt"])!=0), None)
+        if not pos: raise HTTPException(status_code=404, detail="Açık pozisyon yok")
+        amt  = float(pos["positionAmt"])
+        side = "SELL" if amt > 0 else "BUY"
+        result = req(FUTURES_BASE, "/fapi/v1/order", {"symbol":sym,"side":side,"type":"MARKET","quantity":abs(amt),"reduceOnly":"true"}, TRADE_KEY, TRADE_SECRET, "POST")
+        return {"success":True,"message":sym+" pozisyon kapatıldı","orderId":result["orderId"]}
+    except HTTPException: raise
+    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
