@@ -285,26 +285,62 @@ def signal_one(symbol: str):
     return {"success":True,"signal":analyze_coin(symbol.upper())}
 
 # ── Haber endpoint'i ──────────────────────────────────────────────────────────
-@app.get("/api/news")
-def news(currencies: str = "BTC,ETH,SOL"):
+import xml.etree.ElementTree as ET
+
+def fetch_rss(url, source_name, limit=8):
     try:
-        url = f"https://cryptopanic.com/api/v1/posts/?auth_token=free&public=true&currencies={currencies}&kind=news"
-        with urllib.request.urlopen(url, timeout=10) as r:
-            data = json.loads(r.read().decode())
-        posts = data.get("results", [])[:10]
+        req = urllib.request.Request(url, headers={"User-Agent":"Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            content = r.read().decode("utf-8", errors="ignore")
+        root = ET.fromstring(content)
         items = []
-        for p in posts:
-            items.append({
-                "title":      p.get("title",""),
-                "url":        p.get("url",""),
-                "source":     p.get("source",{}).get("title",""),
-                "published":  p.get("published_at",""),
-                "currencies": [c["code"] for c in p.get("currencies",[])],
-                "votes":      p.get("votes",{}),
-            })
-        return {"success":True,"news":items}
+        for item in root.findall(".//item")[:limit]:
+            title = item.findtext("title","").strip()
+            link  = item.findtext("link","").strip()
+            pub   = item.findtext("pubDate","").strip()
+            if title and link:
+                items.append({"title":title,"url":link,"source":source_name,
+                              "published":pub,"currencies":[],"positive":0,"negative":0})
+        return items
     except Exception as e:
-        return {"success":False,"news":[],"error":str(e)}
+        return []
+
+@app.get("/api/news")
+def news():
+    all_items = []
+    
+    # Kaynak 1: CoinTelegraph
+    items = fetch_rss("https://cointelegraph.com/rss", "CoinTelegraph", 6)
+    all_items.extend(items)
+    
+    # Kaynak 2: CoinDesk
+    if len(all_items) < 8:
+        items2 = fetch_rss("https://www.coindesk.com/arc/outboundfeeds/rss/", "CoinDesk", 6)
+        all_items.extend(items2)
+    
+    # Kaynak 3: Bitcoin Magazine
+    if len(all_items) < 10:
+        items3 = fetch_rss("https://bitcoinmagazine.com/feed", "Bitcoin Magazine", 4)
+        all_items.extend(items3)
+
+    # Kaynak 4: CryptoPanic (bonus)
+    try:
+        url = "https://cryptopanic.com/api/v1/posts/?auth_token=free&public=true&kind=news"
+        with urllib.request.urlopen(urllib.request.Request(url,headers={"User-Agent":"Mozilla/5.0"}), timeout=8) as r:
+            data = json.loads(r.read().decode())
+        for p in data.get("results",[])[:5]:
+            all_items.append({
+                "title":     p.get("title",""),
+                "url":       p.get("url",""),
+                "source":    p.get("source",{}).get("title","CryptoPanic"),
+                "published": p.get("published_at",""),
+                "currencies":[c["code"] for c in p.get("currencies",[])],
+                "positive":  p.get("votes",{}).get("positive",0),
+                "negative":  p.get("votes",{}).get("negative",0),
+            })
+    except: pass
+
+    return {"success": True, "news": all_items[:15]}
 
 # ── Emir endpoint'leri ────────────────────────────────────────────────────────
 class SpotOrder(BaseModel):
