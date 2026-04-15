@@ -389,6 +389,174 @@ KURALLAR:
     except Exception as e:
         return {"success": False, "text": "Hata: " + str(e)}
 
+# ── Fear & Greed Index ───────────────────────────────────────────────────────
+@app.get("/api/market-sentiment")
+def market_sentiment():
+    try:
+        # Fear & Greed Index (alternative.me - ücretsiz)
+        fng_url = "https://api.alternative.me/fng/?limit=7&format=json"
+        req = urllib.request.Request(fng_url, headers={"User-Agent":"Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            fng_data = json.loads(r.read().decode())
+        
+        fng = fng_data["data"][0]
+        fng_history = fng_data["data"][:7]
+        
+        # BTC dominance ve global market cap (CoinGecko)
+        global_data = {}
+        try:
+            gcko = urllib.request.Request(
+                "https://api.coingecko.com/api/v3/global",
+                headers={"User-Agent":"Mozilla/5.0"}
+            )
+            with urllib.request.urlopen(gcko, timeout=8) as r:
+                gd = json.loads(r.read().decode())["data"]
+                global_data = {
+                    "total_market_cap_usd": gd["total_market_cap"]["usd"],
+                    "total_volume_usd":     gd["total_volume"]["usd"],
+                    "btc_dominance":        round(gd["market_cap_percentage"]["btc"], 1),
+                    "eth_dominance":        round(gd["market_cap_percentage"].get("eth", 0), 1),
+                    "market_cap_change_24h":round(gd["market_cap_change_percentage_24h_usd"], 2),
+                }
+        except: pass
+
+        return {
+            "success": True,
+            "fear_greed": {
+                "value":       int(fng["value"]),
+                "label":       fng["value_classification"],
+                "label_tr":    {"Extreme Fear":"Aşırı Korku","Fear":"Korku","Neutral":"Nötr","Greed":"Açgözlülük","Extreme Greed":"Aşırı Açgözlülük"}.get(fng["value_classification"],"Nötr"),
+                "history":     [{"value":int(d["value"]),"label":d["value_classification"]} for d in fng_history],
+            },
+            "global": global_data
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+# ── Büyük İşlem Tespiti (Whale proxy) ────────────────────────────────────────
+@app.get("/api/whale-activity/{symbol}")
+def whale_activity(symbol: str):
+    try:
+        sym = symbol.upper() + "USDT"
+        # Son 100 büyük işlemi al
+        url = f"{BASE}/api/v3/trades?symbol={sym}&limit=200"
+        with urllib.request.urlopen(url, timeout=10) as r:
+            trades = json.loads(r.read().decode())
+        
+        # Fiyatı al
+        price_url = f"{BASE}/api/v3/ticker/price?symbol={sym}"
+        with urllib.request.urlopen(price_url, timeout=5) as r:
+            price = float(json.loads(r.read().decode())["price"])
+        
+        # Büyük işlemleri filtrele ($50k+)
+        whale_threshold = 50000
+        whale_trades = []
+        buy_volume = 0
+        sell_volume = 0
+        
+        for t in trades:
+            qty = float(t["qty"])
+            p   = float(t["price"])
+            val = qty * p
+            if val >= whale_threshold:
+                whale_trades.append({
+                    "time":  t["time"],
+                    "side":  "BUY" if not t["isBuyerMaker"] else "SELL",
+                    "value": round(val),
+                    "price": round(p, 6),
+                })
+                if not t["isBuyerMaker"]:
+                    buy_volume += val
+                else:
+                    sell_volume += val
+        
+        total = buy_volume + sell_volume
+        buy_pct = round(buy_volume/total*100) if total > 0 else 50
+        
+        return {
+            "success":     True,
+            "symbol":      sym,
+            "whale_trades":whale_trades[-10:],
+            "buy_volume":  round(buy_volume),
+            "sell_volume": round(sell_volume),
+            "buy_pct":     buy_pct,
+            "sentiment":   "BULLISH" if buy_pct > 60 else "BEARISH" if buy_pct < 40 else "NEUTRAL",
+            "count":       len(whale_trades)
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+# ── Backtest ──────────────────────────────────────────────────────────────────
+@app.get("/api/backtest/{symbol}")
+def backtest(symbol: str, days: int = 30):
+    try:
+        sym = symbol.upper() + "USDT"
+        # 1 saatlik mumlar — 30 gün = 720 mum
+        limit = min(days * 24, 1000)
+        url = f"{BASE}/api/v3/klines?symbol={sym}&interval=1h&limit={limit}"
+        with urllib.request.urlopen(url, timeout=15) as r:
+            klines = json.loads(r.read().decode())
+        
+        closes = [float(k[4]) for k in klines]
+        results = []
+        wins = 0
+        losses = 0
+        
+        # Her 24 saatte bir RSI hesapla, sinyal üretiliyorsa 24 saat sonraki fiyatla karşılaştır
+        for i in range(20, len(closes) - 24, 24):
+            window = closes[max(0,i-14):i+1]
+            rsi = 50
+            if len(window) >= 15:
+                gains = sum(max(0, window[j]-window[j-1]) for j in range(1,len(window)))
+                losses_sum = sum(max(0, window[j-1]-window[j]) for j in range(1,len(window)))
+                n = len(window)-1
+                if losses_sum/n > 0:
+                    rsi = round(100 - 100/(1 + (gains/n)/(losses_sum/n)))
+            
+            entry_price  = closes[i]
+            exit_price   = closes[i+24]  # 24 saat sonra
+            change_pct   = (exit_price - entry_price) / entry_price * 100
+            signal       = "AL" if rsi < 45 else "SAT" if rsi > 70 else "BEKLE"
+            
+            if signal in ("AL", "SAT"):
+                success = (signal=="AL" and change_pct > 0) or (signal=="SAT" and change_pct < 0)
+                if success: wins += 1
+                else: losses += 1
+                results.append({
+                    "timestamp": klines[i][0],
+                    "signal":    signal,
+                    "entry":     round(entry_price, 4),
+                    "exit":      round(exit_price, 4),
+                    "change":    round(change_pct, 2),
+                    "success":   success
+                })
+        
+        total_signals = wins + losses
+        win_rate = round(wins/total_signals*100) if total_signals > 0 else 0
+        
+        # Toplam kâr/zarar simülasyonu ($1000 başlangıç)
+        capital = 1000
+        for r in results:
+            if r["signal"] == "AL":
+                capital *= (1 + r["change"]/100)
+            elif r["signal"] == "SAT":
+                capital *= (1 - r["change"]/100)
+        
+        return {
+            "success":       True,
+            "symbol":        sym,
+            "days":          days,
+            "total_signals": total_signals,
+            "wins":          wins,
+            "losses":        losses,
+            "win_rate":      win_rate,
+            "final_capital": round(capital, 2),
+            "profit_pct":    round((capital-1000)/10, 2),
+            "last_signals":  results[-10:]
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
 # ── Emir endpoint'leri ────────────────────────────────────────────────────────
 class SpotOrder(BaseModel):
     symbol:     str
