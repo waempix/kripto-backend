@@ -357,7 +357,7 @@ def ai_analyze(req: AIRequest):
         payload = json.dumps({
             "model": "claude-sonnet-4-20250514",
             "max_tokens": 500,
-            "system": "Sen bir kripto para analistsin. Türkçe yanıt ver, kısa ve net ol, maksimum 120 kelime." + (f" Güncel sinyaller: {req.context}" if req.context else ""),
+            "system": "Sen bir kripto para analistsin. Türkçe yanıt ver, kısa ve net ol, maksimum 120 kelime. BTC/ETH gibi major coinleri değil; Layer1, Layer2, DeFi, AI ve Meme altcoinleri öner. Markdown kullanma, düz metin yaz." + (f" Güncel AL sinyalleri: {req.context}" if req.context else ""),
             "messages": [{"role": "user", "content": req.message}]
         }).encode("utf-8")
 
