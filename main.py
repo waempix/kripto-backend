@@ -342,6 +342,43 @@ def news():
 
     return {"success": True, "news": all_items[:15]}
 
+# ── AI Analiz endpoint'i ─────────────────────────────────────────────────────
+CLAUDE_KEY = os.environ.get("CLAUDE_KEY", "")
+
+class AIRequest(BaseModel):
+    message: str
+    context: str = ""
+
+@app.post("/api/ai")
+def ai_analyze(req: AIRequest):
+    if not CLAUDE_KEY:
+        return {"success": False, "text": "CLAUDE_KEY eksik"}
+    try:
+        payload = json.dumps({
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 500,
+            "system": "Sen bir kripto para analistsin. Türkçe yanıt ver, kısa ve net ol, maksimum 120 kelime." + (f" Güncel sinyaller: {req.context}" if req.context else ""),
+            "messages": [{"role": "user", "content": req.message}]
+        }).encode("utf-8")
+
+        r = urllib.request.Request(
+            "https://api.anthropic.com/v1/messages",
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": CLAUDE_KEY,
+                "anthropic-version": "2023-06-01"
+            }
+        )
+        with urllib.request.urlopen(r, timeout=30) as res:
+            data = json.loads(res.read().decode("utf-8"))
+        return {"success": True, "text": data["content"][0]["text"]}
+    except urllib.error.HTTPError as e:
+        body = json.loads(e.read().decode("utf-8"))
+        return {"success": False, "text": "API hatası: " + body.get("error", {}).get("message", str(e))}
+    except Exception as e:
+        return {"success": False, "text": "Hata: " + str(e)}
+
 # ── Emir endpoint'leri ────────────────────────────────────────────────────────
 class SpotOrder(BaseModel):
     symbol:     str
