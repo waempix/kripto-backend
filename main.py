@@ -210,53 +210,63 @@ def close_position(symbol: str):
 def get_news():
     """Kripto haberlerini çeşitli kaynaklardan çek"""
     
-    # Kaynak 1: CryptoCompare (Rate limit daha generous)
-    try:
-        url = "https://min-api.cryptocompare.com/data/v2/news/?lang=EN"
-        with urllib.request.urlopen(url, timeout=8) as response:
-            data = json.loads(response.read().decode("utf-8"))
-        
-        if data.get("Data"):
-            news = []
-            for item in data["Data"][:15]:
-                news.append({
-                    "title": item.get("title", ""),
-                    "url": item.get("url", "#"),
-                    "source": item.get("source", "CryptoCompare"),
-                    "published": str(item.get("published_on", "")),
-                    "currencies": [],
-                    "positive": 0,
-                    "negative": 0
-                })
+    # Kaynak 1: NewsAPI (En güvenilir - API key gerekli)
+    NEWS_API_KEY = os.environ.get("NEWS_API_KEY", "")
+    
+    if NEWS_API_KEY:
+        try:
+            # Kripto haberleri ara
+            url = f"https://newsapi.org/v2/everything?q=cryptocurrency OR bitcoin OR ethereum&language=en&sortBy=publishedAt&pageSize=15&apiKey={NEWS_API_KEY}"
+            with urllib.request.urlopen(url, timeout=10) as response:
+                data = json.loads(response.read().decode("utf-8"))
             
-            if len(news) > 0:
-                return {"success": True, "news": news, "source": "cryptocompare"}
-    except:
-        pass
+            if data.get("status") == "ok" and data.get("articles"):
+                news = []
+                for item in data["articles"][:15]:
+                    news.append({
+                        "title": item.get("title", ""),
+                        "url": item.get("url", "#"),
+                        "source": item.get("source", {}).get("name", "NewsAPI"),
+                        "published": item.get("publishedAt", ""),
+                        "description": item.get("description", ""),
+                        "currencies": [],
+                        "positive": 0,
+                        "negative": 0
+                    })
+                
+                if len(news) > 0:
+                    return {"success": True, "news": news, "source": "newsapi"}
+        except:
+            pass
     
-    # Kaynak 2: CoinPaprika
-    try:
-        url = "https://api.coinpaprika.com/v1/global"
-        with urllib.request.urlopen(url, timeout=8) as response:
-            data = json.loads(response.read().decode("utf-8"))
-        
-        # CoinPaprika'da doğrudan haber yok, global piyasa verisinden basit haber oluştur
-        news = [{
-            "title": f"Bitcoin Market Cap: ${data.get('market_cap_usd', 0) / 1e9:.1f}B | 24h Vol: ${data.get('volume_24h_usd', 0) / 1e9:.1f}B",
-            "url": "https://coinpaprika.com",
-            "source": "CoinPaprika",
-            "published": str(int(time.time())),
-            "currencies": ["BTC"],
-            "positive": 1 if data.get('market_cap_change_24h', 0) > 0 else 0,
-            "negative": 1 if data.get('market_cap_change_24h', 0) < 0 else 0
-        }]
-        
-        if len(news) > 0:
-            return {"success": True, "news": news, "source": "coinpaprika"}
-    except:
-        pass
+    # Kaynak 2: CryptoPanic (API key opsiyonel ama rate limit daha bol)
+    CRYPTOPANIC_KEY = os.environ.get("CRYPTOPANIC_API_KEY", "")
     
-    # Kaynak 3: CoinGecko (fallback)
+    if CRYPTOPANIC_KEY:
+        try:
+            url = f"https://cryptopanic.com/api/v1/posts/?auth_token={CRYPTOPANIC_KEY}&public=true&kind=news"
+            with urllib.request.urlopen(url, timeout=8) as response:
+                data = json.loads(response.read().decode("utf-8"))
+            
+            if data.get("results"):
+                news = []
+                for item in data["results"][:15]:
+                    news.append({
+                        "title": item.get("title", ""),
+                        "url": item.get("url", "#"),
+                        "source": item.get("source", {}).get("title", "CryptoPanic"),
+                        "published": item.get("published_at", ""),
+                        "currencies": [c.get("code") for c in item.get("currencies", [])],
+                        "positive": 1 if item.get("votes", {}).get("positive", 0) > item.get("votes", {}).get("negative", 0) else 0,
+                        "negative": 1 if item.get("votes", {}).get("negative", 0) > item.get("votes", {}).get("positive", 0) else 0
+                    })
+                
+                if len(news) > 0:
+                    return {"success": True, "news": news, "source": "cryptopanic"}
+        except:
+            pass
+    
+    # Kaynak 3: CoinGecko (fallback - rate limit var)
     try:
         url = "https://api.coingecko.com/api/v3/news"
         with urllib.request.urlopen(url, timeout=8) as response:
