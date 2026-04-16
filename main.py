@@ -300,81 +300,94 @@ def smart_score(symbol: str):
         except:
             buy_pressure = 1.0
         
-        # Hacim analizi
-        avg_volume = sum(float(k[5]) for k in klines[-24:]) / 24
+        # Hacim analizi - DÜZELTME
+        # Son 24 saatlik toplam hacim
         current_volume = float(ticker["quoteVolume"])
-        volume_ratio = current_volume / avg_volume if avg_volume > 0 else 1.0
+        
+        # Önceki 24 saatlik toplam hacim (48-24 saat arası)
+        if len(klines) >= 48:
+            prev_volume = sum(float(k[5]) for k in klines[-48:-24])
+            volume_ratio = current_volume / prev_volume if prev_volume > 0 else 1.0
+        else:
+            # Yeterli veri yoksa güncel ile son 24 saatin ortalamasını karşılaştır
+            avg_hourly = sum(float(k[5]) for k in klines[-24:]) / 24
+            current_hourly = float(klines[-1][5]) if klines else avg_hourly
+            volume_ratio = current_hourly / avg_hourly if avg_hourly > 0 else 1.0
         
         # SKOR HESAPLAMA
         score = 50  # Başlangıç
         reasons = []
         
-        # 1. Teknik Analiz (25 puan)
-        if rsi < 30:
-            score += 10
+        # 1. Teknik Analiz (max 25 puan) - SIKLAŞTIRILDI
+        if rsi < 25:
+            score += 15
             reasons.append(f"RSI {rsi:.0f} aşırı satım")
-        elif rsi < 40:
-            score += 7
+        elif rsi < 35:
+            score += 10
             reasons.append(f"RSI {rsi:.0f} alım bölgesi")
-        elif rsi < 50:
-            score += 3
-        elif rsi > 70:
-            score -= 8
+        elif rsi < 45:
+            score += 5
+        elif rsi > 75:
+            score -= 12
             reasons.append(f"RSI {rsi:.0f} aşırı alım")
-        elif rsi > 60:
-            score -= 3
+        elif rsi > 65:
+            score -= 6
         
         if macd_signal == 1:
-            score += 8
+            score += 6  # 8'den 6'ya düşürüldü
             reasons.append("MACD alım sinyali")
         else:
-            score -= 5
+            score -= 4  # Daha sert ceza
         
         if bb_position == -1:
-            score += 7
+            score += 8  # 7'den 8'e (sadece dip önemli)
             reasons.append("BB alt bant (dip)")
         elif bb_position == 1:
-            score -= 7
+            score -= 10  # 7'den 10'a (zirve tehlikeli)
             reasons.append("BB üst bant (zirve)")
         
-        # 2. Alım/Satım Baskısı (15 puan)
-        if buy_pressure > 2.5:
+        # 2. Alım/Satım Baskısı (max 15 puan) - SIKLAŞTIRILDI
+        if buy_pressure > 3.0:  # 2.5'ten 3.0'a
             score += 15
-            reasons.append(f"Güçlü alım baskısı {buy_pressure:.1f}x")
-        elif buy_pressure > 1.5:
+            reasons.append(f"Çok güçlü alım {buy_pressure:.1f}x")
+        elif buy_pressure > 2.0:  # 1.5'ten 2.0'a
             score += 10
-            reasons.append(f"Alım baskısı {buy_pressure:.1f}x")
-        elif buy_pressure > 1.0:
+            reasons.append(f"Güçlü alım {buy_pressure:.1f}x")
+        elif buy_pressure > 1.3:  # 1.0'dan 1.3'e
             score += 5
-        elif buy_pressure < 0.7:
-            score -= 10
-            reasons.append(f"Satış baskısı {buy_pressure:.1f}x")
+        elif buy_pressure < 0.6:  # 0.7'den 0.6'ya
+            score -= 12  # 10'dan 12'ye
+            reasons.append(f"Güçlü satış {buy_pressure:.1f}x")
+        elif buy_pressure < 0.85:
+            score -= 5
         
-        # 3. Hacim Artışı (10 puan)
-        if volume_ratio > 2.0:
+        # 3. Hacim Artışı (max 10 puan) - SIKLAŞTIRILDI
+        if volume_ratio > 2.5:  # 2.0'dan 2.5'e
             score += 10
             reasons.append(f"Hacim %{(volume_ratio-1)*100:.0f} arttı")
-        elif volume_ratio > 1.5:
+        elif volume_ratio > 1.8:  # 1.5'ten 1.8'e
             score += 6
-            reasons.append(f"Hacim artışı {volume_ratio:.1f}x")
-        elif volume_ratio > 1.2:
+        elif volume_ratio > 1.3:  # 1.2'den 1.3'e
             score += 3
+        elif volume_ratio < 0.7:  # Düşük hacim cezası
+            score -= 4
         
-        # 4. Momentum (5 puan)
+        # 4. Momentum (max 5 puan) - SIKLAŞTIRILDI
         price_change = float(ticker["priceChangePercent"])
-        if price_change > 20:
+        if price_change > 25:  # 20'den 25'e
             score += 5
-            reasons.append(f"+%{price_change:.1f} güçlü yükseliş")
-        elif price_change > 10:
-            score += 4
-        elif price_change > 5:
+        elif price_change > 15:  # 10'dan 15'e
+            score += 3
+        elif price_change > 8:
             score += 2
-        elif price_change < -10:
-            score -= 5
+        elif price_change < -15:  # -10'dan -15'e
+            score -= 8  # 5'ten 8'e
             reasons.append(f"%{price_change:.1f} düşüş")
+        elif price_change < -8:
+            score -= 4
         
-        # Limit
-        score = max(5, min(95, score))
+        # Limit - SIKLAŞTIRILDI
+        score = max(10, min(90, score))  # 5-95'ten 10-90'a
         
         # Sinyal
         if score >= 80:
