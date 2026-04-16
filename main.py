@@ -208,17 +208,28 @@ def close_position(symbol: str):
 
 @app.get("/api/news")
 def get_news():
-    """Kripto haberlerini çeşitli kaynaklardan çek"""
+    """Kripto haberlerini çeşitli kaynaklardan çek - DETAYLı LOGGING"""
     
-    # Kaynak 1: NewsAPI (En güvenilir - API key gerekli)
+    errors = []  # Hata logları
+    
+    # Kaynak 1: NewsAPI
     NEWS_API_KEY = os.environ.get("NEWS_API_KEY", "")
+    
+    print(f"[NEWS] NEWS_API_KEY exists: {bool(NEWS_API_KEY)}")
+    print(f"[NEWS] NEWS_API_KEY length: {len(NEWS_API_KEY) if NEWS_API_KEY else 0}")
     
     if NEWS_API_KEY:
         try:
-            # Kripto haberleri ara
             url = f"https://newsapi.org/v2/everything?q=cryptocurrency OR bitcoin OR ethereum&language=en&sortBy=publishedAt&pageSize=15&apiKey={NEWS_API_KEY}"
-            with urllib.request.urlopen(url, timeout=10) as response:
+            print(f"[NEWS] Trying NewsAPI...")
+            
+            req_obj = urllib.request.Request(url)
+            req_obj.add_header('User-Agent', 'Mozilla/5.0')
+            
+            with urllib.request.urlopen(req_obj, timeout=15) as response:
                 data = json.loads(response.read().decode("utf-8"))
+            
+            print(f"[NEWS] NewsAPI response status: {data.get('status')}")
             
             if data.get("status") == "ok" and data.get("articles"):
                 news = []
@@ -235,17 +246,28 @@ def get_news():
                     })
                 
                 if len(news) > 0:
+                    print(f"[NEWS] NewsAPI SUCCESS: {len(news)} articles")
                     return {"success": True, "news": news, "source": "newsapi"}
-        except:
-            pass
+        except urllib.error.HTTPError as e:
+            error_msg = f"NewsAPI HTTP {e.code}: {e.read().decode('utf-8')}"
+            print(f"[NEWS] NewsAPI HTTPError: {error_msg}")
+            errors.append(error_msg)
+        except Exception as e:
+            error_msg = f"NewsAPI Error: {type(e).__name__} - {str(e)}"
+            print(f"[NEWS] NewsAPI Exception: {error_msg}")
+            errors.append(error_msg)
+    else:
+        errors.append("NEWS_API_KEY not set")
     
-    # Kaynak 2: CryptoPanic (API key opsiyonel ama rate limit daha bol)
+    # Kaynak 2: CryptoPanic
     CRYPTOPANIC_KEY = os.environ.get("CRYPTOPANIC_API_KEY", "")
     
     if CRYPTOPANIC_KEY:
         try:
             url = f"https://cryptopanic.com/api/v1/posts/?auth_token={CRYPTOPANIC_KEY}&public=true&kind=news"
-            with urllib.request.urlopen(url, timeout=8) as response:
+            print(f"[NEWS] Trying CryptoPanic...")
+            
+            with urllib.request.urlopen(url, timeout=10) as response:
                 data = json.loads(response.read().decode("utf-8"))
             
             if data.get("results"):
@@ -262,14 +284,19 @@ def get_news():
                     })
                 
                 if len(news) > 0:
+                    print(f"[NEWS] CryptoPanic SUCCESS: {len(news)} articles")
                     return {"success": True, "news": news, "source": "cryptopanic"}
-        except:
-            pass
+        except Exception as e:
+            error_msg = f"CryptoPanic Error: {str(e)}"
+            print(f"[NEWS] {error_msg}")
+            errors.append(error_msg)
     
-    # Kaynak 3: CoinGecko (fallback - rate limit var)
+    # Kaynak 3: CoinGecko
     try:
         url = "https://api.coingecko.com/api/v3/news"
-        with urllib.request.urlopen(url, timeout=8) as response:
+        print(f"[NEWS] Trying CoinGecko...")
+        
+        with urllib.request.urlopen(url, timeout=10) as response:
             data = json.loads(response.read().decode("utf-8"))
         
         news = []
@@ -287,12 +314,17 @@ def get_news():
             })
         
         if len(news) > 0:
+            print(f"[NEWS] CoinGecko SUCCESS: {len(news)} articles")
             return {"success": True, "news": news, "source": "coingecko"}
-    except:
-        pass
+    except Exception as e:
+        error_msg = f"CoinGecko Error: {str(e)}"
+        print(f"[NEWS] {error_msg}")
+        errors.append(error_msg)
     
-    # Tüm kaynaklar başarısız - frontend RSS'lere düşsün
-    return {"success": False, "news": [], "error": "All sources failed, frontend will use RSS fallbacks"}
+    # Tüm kaynaklar başarısız
+    print(f"[NEWS] ALL SOURCES FAILED")
+    print(f"[NEWS] Errors: {errors}")
+    return {"success": False, "news": [], "error": "All sources failed", "details": errors}
 
 # ── Gelişmiş Piyasa Analizi ───────────────────────────────────────────────────
 @app.get("/api/market-analysis")
@@ -388,25 +420,22 @@ def smart_score(symbol: str):
         except:
             buy_pressure = 1.0
         
-        # Hacim analizi - DÜZELTME
-        # Son 24 saatlik toplam hacim
+        # Hacim analizi
         current_volume = float(ticker["quoteVolume"])
         
-        # Önceki 24 saatlik toplam hacim (48-24 saat arası)
         if len(klines) >= 48:
             prev_volume = sum(float(k[5]) for k in klines[-48:-24])
             volume_ratio = current_volume / prev_volume if prev_volume > 0 else 1.0
         else:
-            # Yeterli veri yoksa güncel ile son 24 saatin ortalamasını karşılaştır
             avg_hourly = sum(float(k[5]) for k in klines[-24:]) / 24
             current_hourly = float(klines[-1][5]) if klines else avg_hourly
             volume_ratio = current_hourly / avg_hourly if avg_hourly > 0 else 1.0
         
         # SKOR HESAPLAMA
-        score = 50  # Başlangıç
+        score = 50
         reasons = []
         
-        # 1. Teknik Analiz (max 25 puan) - SIKLAŞTIRILDI
+        # Teknik Analiz
         if rsi < 25:
             score += 15
             reasons.append(f"RSI {rsi:.0f} aşırı satım")
@@ -422,64 +451,62 @@ def smart_score(symbol: str):
             score -= 6
         
         if macd_signal == 1:
-            score += 6  # 8'den 6'ya düşürüldü
+            score += 6
             reasons.append("MACD alım sinyali")
         else:
-            score -= 4  # Daha sert ceza
+            score -= 4
         
         if bb_position == -1:
-            score += 8  # 7'den 8'e (sadece dip önemli)
+            score += 8
             reasons.append("BB alt bant (dip)")
         elif bb_position == 1:
-            score -= 10  # 7'den 10'a (zirve tehlikeli)
+            score -= 10
             reasons.append("BB üst bant (zirve)")
         
-        # 2. Alım/Satım Baskısı (max 15 puan) - SIKLAŞTIRILDI
-        if buy_pressure > 3.0:  # 2.5'ten 3.0'a
+        # Alım/Satım Baskısı
+        if buy_pressure > 3.0:
             score += 15
             reasons.append(f"Çok güçlü alım {buy_pressure:.1f}x")
-        elif buy_pressure > 2.0:  # 1.5'ten 2.0'a
+        elif buy_pressure > 2.0:
             score += 10
             reasons.append(f"Güçlü alım {buy_pressure:.1f}x")
-        elif buy_pressure > 1.3:  # 1.0'dan 1.3'e
+        elif buy_pressure > 1.3:
             score += 5
-        elif buy_pressure < 0.6:  # 0.7'den 0.6'ya
-            score -= 12  # 10'dan 12'ye
+        elif buy_pressure < 0.6:
+            score -= 12
             reasons.append(f"Güçlü satış {buy_pressure:.1f}x")
         elif buy_pressure < 0.85:
             score -= 5
         
-        # 3. Hacim Artışı (max 10 puan) - SIKLAŞTIRILDI
-        if volume_ratio > 2.5:  # 2.0'dan 2.5'e
+        # Hacim Artışı
+        if volume_ratio > 2.5:
             score += 10
             reasons.append(f"Hacim %{(volume_ratio-1)*100:.0f} arttı")
-        elif volume_ratio > 1.8:  # 1.5'ten 1.8'e
+        elif volume_ratio > 1.8:
             score += 6
-        elif volume_ratio > 1.3:  # 1.2'den 1.3'e
+        elif volume_ratio > 1.3:
             score += 3
-        elif volume_ratio < 0.7:  # Düşük hacim cezası
+        elif volume_ratio < 0.7:
             score -= 4
         
-        # 4. Momentum (max 5 puan) - SIKLAŞTIRILDI
+        # Momentum
         price_change = float(ticker["priceChangePercent"])
-        if price_change > 25:  # 20'den 25'e
+        if price_change > 25:
             score += 5
-        elif price_change > 15:  # 10'dan 15'e
+        elif price_change > 15:
             score += 3
         elif price_change > 8:
             score += 2
-        elif price_change < -15:  # -10'dan -15'e
-            score -= 8  # 5'ten 8'e
+        elif price_change < -15:
+            score -= 8
             reasons.append(f"%{price_change:.1f} düşüş")
         elif price_change < -8:
             score -= 4
         
-        # Limit - Genişletildi
-        score = max(10, min(95, score))  # 10-95 arası (nadiren 90+ olur)
+        score = max(10, min(95, score))
         
-        # Sinyal - Genişletildi
         if score >= 90:
-            signal = "ÇOK GÜÇLÜ AL"  # Nadiren olur
+            signal = "ÇOK GÜÇLÜ AL"
         elif score >= 80:
             signal = "GÜÇLÜ AL"
         elif score >= 68:
@@ -585,9 +612,8 @@ def market_sentiment():
             raise Exception("No data")
         
         current = data["data"][0]
-        history = data["data"][:7]  # Son 7 gün
+        history = data["data"][:7]
         
-        # Türkçe label
         value = int(current["value"])
         if value < 25:
             label_tr = "Aşırı Korku"
@@ -610,7 +636,7 @@ def market_sentiment():
                 "history": [{"value": int(h["value"]), "timestamp": h["timestamp"]} for h in history]
             },
             "global": {
-                "btc_dominance": 54.2,  # Placeholder - gerçek API eklenebilir
+                "btc_dominance": 54.2,
                 "total_volume_usd": 95000000000,
                 "market_cap_change_24h": 2.4
             }
@@ -626,7 +652,7 @@ class AIRequest(BaseModel):
 
 @app.post("/api/ai")
 def ai_chat(req: AIRequest):
-    """Claude AI ile sohbet - CLAUDE API KEY gerekli"""
+    """Claude AI ile sohbet"""
     CLAUDE_KEY = os.environ.get("CLAUDE_API_KEY", "")
     
     if not CLAUDE_KEY:
@@ -642,7 +668,7 @@ KULLANICI SORUSU: {req.message}
 
 ODAK: {req.focus} coinleri
 
-CEVAP (max 3 paragraf, direkt cevap ver):"""
+CEVAP (max 3 paragraf):"""
 
         headers = {
             "x-api-key": CLAUDE_KEY,
@@ -671,14 +697,12 @@ CEVAP (max 3 paragraf, direkt cevap ver):"""
     except Exception as e:
         return {"success": False, "text": f"AI hatası: {str(e)}"}
 
-# ── Backtest (Sinyal Doğruluğu) ───────────────────────────────────────────────
+# ── Backtest ──────────────────────────────────────────────────────────────────
 @app.get("/api/backtest/{symbol}")
 def backtest_signals(symbol: str, days: int = 30):
-    """Geçmiş RSI sinyallerinin ne kadar doğru olduğunu test et"""
+    """Geçmiş RSI sinyallerinin doğruluğunu test et"""
     try:
         sym = symbol.upper() + "USDT"
-        
-        # Son N günlük 1 saatlik mum verisi
         interval = "1h"
         limit = days * 24
         
@@ -689,13 +713,12 @@ def backtest_signals(symbol: str, days: int = 30):
         losses = 0
         capital = 1000.0
         
-        for i in range(14, len(klines) - 24):  # RSI için 14 periyot, test için 24 saat sonrası gerekli
+        for i in range(14, len(klines) - 24):
             closes = [float(k[4]) for k in klines[max(0, i-14):i+1]]
             
             if len(closes) < 14:
                 continue
             
-            # RSI hesapla
             gains = []
             losses_list = []
             for j in range(1, len(closes)):
@@ -717,9 +740,8 @@ def backtest_signals(symbol: str, days: int = 30):
                 rsi = 100 - (100 / (1 + rs))
             
             entry_price = float(klines[i][4])
-            exit_price = float(klines[i + 24][4])  # 24 saat sonra
+            exit_price = float(klines[i + 24][4])
             
-            # Sinyal belirle
             signal = None
             if rsi < 30:
                 signal = "AL"
@@ -764,7 +786,7 @@ def backtest_signals(symbol: str, days: int = 30):
             "win_rate": round(win_rate, 1),
             "final_capital": round(capital, 2),
             "profit_pct": round(((capital - 1000) / 1000) * 100, 1),
-            "last_signals": signals[-10:]  # Son 10 sinyal
+            "last_signals": signals[-10:]
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
