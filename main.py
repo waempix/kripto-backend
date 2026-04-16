@@ -1,14 +1,17 @@
-import os, time, hmac, hashlib, json, math
+import os, time, hmac, hashlib, json
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional
 import urllib.request, urllib.parse
 
-READ_KEY     = os.environ.get("BINANCE_API_KEY", "")
-READ_SECRET  = os.environ.get("BINANCE_API_SECRET", "")
+# Okuma key (bakiye görme)
+READ_KEY    = os.environ.get("BINANCE_API_KEY", "")
+READ_SECRET = os.environ.get("BINANCE_API_SECRET", "")
+
+# Trading key (emir gönderme)
 TRADE_KEY    = os.environ.get("BINANCE_TRADE_KEY", "")
 TRADE_SECRET = os.environ.get("BINANCE_TRADE_SECRET", "")
+
 BASE         = "https://api.binance.com"
 FUTURES_BASE = "https://fapi.binance.com"
 
@@ -25,12 +28,15 @@ def sign(params, secret):
     return q + "&signature=" + sig
 
 def req(base, path, params, key, secret, method="GET"):
-    q = sign(params, secret)
+    q   = sign(params, secret)
+    url = base + path + "?" + q
+    r   = urllib.request.Request(url, headers={"X-MBX-APIKEY": key})
+    r.method = method
     if method == "POST":
-        r = urllib.request.Request(base+path, data=q.encode(),
-            headers={"X-MBX-APIKEY":key,"Content-Type":"application/x-www-form-urlencoded"})
-    else:
-        r = urllib.request.Request(base+path+"?"+q, headers={"X-MBX-APIKEY":key})
+        r.data = q.encode()
+        r.add_header("Content-Type", "application/x-www-form-urlencoded")
+        r = urllib.request.Request(base + path, data=q.encode(),
+            headers={"X-MBX-APIKEY": key, "Content-Type": "application/x-www-form-urlencoded"})
     try:
         with urllib.request.urlopen(r, timeout=20) as res:
             return json.loads(res.read().decode("utf-8"))
@@ -39,158 +45,12 @@ def req(base, path, params, key, secret, method="GET"):
         raise HTTPException(status_code=e.code, detail=body.get("msg", str(e)))
 
 def get_pub(path, params=None):
-    q = urllib.parse.urlencode(params or {})
-    url = BASE + path + ("?"+q if q else "")
+    q   = urllib.parse.urlencode(params or {})
+    url = BASE + path + ("?" + q if q else "")
     with urllib.request.urlopen(url, timeout=15) as r:
         return json.loads(r.read().decode("utf-8"))
 
-def round_step(qty, step):
-    if step <= 0: return qty
-    precision = max(0, round(-math.log10(step)))
-    return round(math.floor(qty/step)*step, precision)
-
-def get_spot_filters(symbol):
-    try:
-        info = get_pub("/api/v3/exchangeInfo", {"symbol": symbol})
-        step, min_qty, min_notional = 0.001, 0.0, 5.0
-        for f in info["symbols"][0].get("filters",[]):
-            if f["filterType"]=="LOT_SIZE": step=float(f["stepSize"]); min_qty=float(f["minQty"])
-            elif f["filterType"] in ("MIN_NOTIONAL","NOTIONAL"): min_notional=float(f.get("minNotional",f.get("minVal",5.0)))
-        return step, min_qty, min_notional
-    except: return 0.001, 0.0, 5.0
-
-FUTURES_CACHE = {}
-def get_futures_filters(symbol):
-    if symbol in FUTURES_CACHE: return FUTURES_CACHE[symbol]
-    try:
-        info = json.loads(urllib.request.urlopen(FUTURES_BASE+"/fapi/v1/exchangeInfo",timeout=10).read().decode())
-        for s in info["symbols"]:
-            step, min_n = 0.001, 5.0
-            for f in s.get("filters",[]):
-                if f["filterType"]=="LOT_SIZE": step=float(f["stepSize"])
-                elif f["filterType"]=="MIN_NOTIONAL": min_n=float(f.get("notional",5.0))
-            FUTURES_CACHE[s["symbol"]] = (step, min_n)
-        return FUTURES_CACHE.get(symbol,(0.001,5.0))
-    except: return (0.001,5.0)
-
-# ── Teknik Analiz ─────────────────────────────────────────────────────────────
-def get_klines(symbol, interval="1h", limit=100):
-    url = f"{BASE}/api/v3/klines?symbol={symbol}USDT&interval={interval}&limit={limit}"
-    with urllib.request.urlopen(url, timeout=15) as r:
-        return json.loads(r.read().decode())
-
-def calc_rsi(closes, period=14):
-    if len(closes) < period+1: return 50
-    gains, losses = [], []
-    for i in range(1, len(closes)):
-        diff = closes[i] - closes[i-1]
-        gains.append(max(diff,0)); losses.append(max(-diff,0))
-    avg_g = sum(gains[-period:]) / period
-    avg_l = sum(losses[-period:]) / period
-    if avg_l == 0: return 100
-    rs = avg_g / avg_l
-    return round(100 - 100/(1+rs), 1)
-
-def calc_ema(values, period):
-    k = 2/(period+1)
-    ema = values[0]
-    for v in values[1:]: ema = v*k + ema*(1-k)
-    return ema
-
-def calc_macd(closes):
-    if len(closes) < 26: return 0, 0
-    ema12 = calc_ema(closes[-12:], 12)
-    ema26 = calc_ema(closes[-26:], 26)
-    macd  = ema12 - ema26
-    return round(macd, 6), 1 if macd > 0 else -1
-
-def calc_bollinger(closes, period=20):
-    if len(closes) < period: return 0, 0, 0
-    window = closes[-period:]
-    mid = sum(window)/period
-    std = (sum((x-mid)**2 for x in window)/period)**0.5
-    upper = mid + 2*std
-    lower = mid - 2*std
-    return round(upper,4), round(mid,4), round(lower,4)
-
-def analyze_coin(symbol):
-    try:
-        klines_1h = get_klines(symbol, "1h", 100)
-        klines_4h = get_klines(symbol, "4h", 50)
-        closes_1h = [float(k[4]) for k in klines_1h]
-        closes_4h = [float(k[4]) for k in klines_4h]
-        volumes   = [float(k[5]) for k in klines_1h[-20:]]
-        
-        rsi       = calc_rsi(closes_1h)
-        _, macd_sig = calc_macd(closes_4h)
-        bb_upper, bb_mid, bb_lower = calc_bollinger(closes_1h)
-        
-        price     = closes_1h[-1]
-        avg_vol   = sum(volumes[:-1])/(len(volumes)-1) if len(volumes)>1 else 0
-        vol_ratio = round(volumes[-1]/avg_vol, 2) if avg_vol > 0 else 1
-        
-        # BB pozisyon: -1 (alt bant), 0 (orta), 1 (üst bant)
-        bb_pos = 0
-        if bb_upper > bb_lower:
-            pct = (price - bb_lower) / (bb_upper - bb_lower)
-            if pct < 0.2: bb_pos = -1   # Alt bant — aşırı satım
-            elif pct > 0.8: bb_pos = 1  # Üst bant — aşırı alım
-        
-        # Sinyal skoru
-        score = 50
-        if rsi < 30: score += 20
-        elif rsi < 40: score += 12
-        elif rsi < 50: score += 6
-        elif rsi > 75: score -= 12
-        elif rsi > 65: score -= 4
-        
-        score += macd_sig * 15
-        
-        if bb_pos == -1: score += 12   # Alt bantta — al fırsatı
-        elif bb_pos == 1: score -= 10  # Üst bantta — dikkat
-        
-        if vol_ratio > 2: score += 10   # Yüksek hacim
-        elif vol_ratio > 1.5: score += 5
-        
-        score = min(99, max(5, score))
-        
-        # Öneri
-        if score >= 80:   rec = "GÜÇLÜ AL"
-        elif score >= 68: rec = "AL"
-        elif score >= 55: rec = "DİKKATLİ AL"
-        elif score >= 45: rec = "BEKLE"
-        elif score >= 35: rec = "SATIŞ BÖLGESİ"
-        else:             rec = "SAT"
-        
-        # Nedenler
-        reasons = []
-        if rsi < 40: reasons.append(f"RSI {rsi} aşırı satım")
-        elif rsi < 50: reasons.append(f"RSI {rsi} alım bölgesi")
-        elif rsi > 65: reasons.append(f"RSI {rsi} güçlü trend")
-        if macd_sig == 1: reasons.append("MACD alım sinyali")
-        elif macd_sig == -1: reasons.append("MACD satış sinyali")
-        if bb_pos == -1: reasons.append("Bollinger alt bant — dip")
-        elif bb_pos == 1: reasons.append("Bollinger üst bant — zirve")
-        if vol_ratio > 1.5: reasons.append(f"Hacim {vol_ratio}x ortalamanın üstünde")
-        
-        return {
-            "symbol":    symbol,
-            "price":     round(price, 8),
-            "rsi":       rsi,
-            "macd":      macd_sig,
-            "bb_upper":  bb_upper,
-            "bb_mid":    bb_mid,
-            "bb_lower":  bb_lower,
-            "bb_pos":    bb_pos,
-            "vol_ratio": vol_ratio,
-            "score":     score,
-            "rec":       rec,
-            "reasons":   reasons[:3],
-        }
-    except Exception as e:
-        return {"symbol": symbol, "error": str(e), "score": 50, "rec": "BEKLE", "reasons": []}
-
-# ── Endpoints ─────────────────────────────────────────────────────────────────
+# ── Okuma endpoint'leri ───────────────────────────────────────────────────────
 @app.get("/api/ping")
 def ping(): return {"status": "ok"}
 
@@ -211,421 +71,401 @@ def portfolio():
         res.sort(key=lambda x: x["usdtValue"], reverse=True)
         return {"success":True,"portfolio":res,"totalUsdt":round(tot,2)}
     except HTTPException: raise
-    except Exception as e: raise HTTPException(status_code=500,detail=str(e))
+    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/trades/{symbol}")
 def trades(symbol: str):
     try:
-        ts = req(BASE,"/api/v3/myTrades",{"symbol":symbol.upper()+"USDT","limit":20},READ_KEY,READ_SECRET)
+        ts = req(BASE, "/api/v3/myTrades", {"symbol":symbol.upper()+"USDT","limit":20}, READ_KEY, READ_SECRET)
         return {"success":True,"trades":[{"time":t["time"],"side":"AL" if t["isBuyer"] else "SAT","price":float(t["price"]),"qty":float(t["qty"]),"total":round(float(t["price"])*float(t["qty"]),2),"fee":float(t["commission"]),"feeCoin":t["commissionAsset"]} for t in ts]}
     except HTTPException: raise
-    except Exception as e: raise HTTPException(status_code=500,detail=str(e))
+    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/open-orders")
 def open_orders():
     try:
-        orders = req(BASE,"/api/v3/openOrders",{},READ_KEY,READ_SECRET)
+        orders = req(BASE, "/api/v3/openOrders", {}, READ_KEY, READ_SECRET)
         return {"success":True,"orders":[{"symbol":o["symbol"],"side":"AL" if o["side"]=="BUY" else "SAT","price":float(o["price"]),"qty":float(o["origQty"]),"status":o["status"]} for o in orders]}
     except HTTPException: raise
-    except Exception as e: raise HTTPException(status_code=500,detail=str(e))
+    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
+# ── Futures bakiye ve pozisyonlar ─────────────────────────────────────────────
 @app.get("/api/futures/balance")
 def futures_balance():
     try:
-        balances = req(FUTURES_BASE,"/fapi/v2/balance",{},TRADE_KEY,TRADE_SECRET)
-        usdt = next((b for b in balances if b["asset"]=="USDT"),None)
+        balances = req(FUTURES_BASE, "/fapi/v2/balance", {}, TRADE_KEY, TRADE_SECRET)
+        usdt = next((b for b in balances if b["asset"]=="USDT"), None)
         if not usdt: return {"success":True,"balance":0,"availableBalance":0}
         return {"success":True,"balance":round(float(usdt["balance"]),2),"availableBalance":round(float(usdt["availableBalance"]),2)}
     except HTTPException: raise
-    except Exception as e: raise HTTPException(status_code=500,detail=str(e))
+    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/futures/positions")
 def futures_positions():
     try:
-        positions = req(FUTURES_BASE,"/fapi/v2/positionRisk",{},TRADE_KEY,TRADE_SECRET)
+        positions = req(FUTURES_BASE, "/fapi/v2/positionRisk", {}, TRADE_KEY, TRADE_SECRET)
+        active = [p for p in positions if float(p["positionAmt"]) != 0]
         result = []
-        for p in positions:
-            if float(p["positionAmt"])==0: continue
-            amt=float(p["positionAmt"]); entry=float(p["entryPrice"]); mark=float(p["markPrice"])
-            pnl=float(p["unRealizedProfit"]); lev=int(p["leverage"])
-            pct=(pnl/(abs(amt)*entry/lev))*100 if entry>0 else 0
-            result.append({"symbol":p["symbol"],"side":"LONG" if amt>0 else "SHORT","size":round(abs(amt),4),"entry":round(entry,4),"mark":round(mark,4),"pnl":round(pnl,2),"pnlPct":round(pct,2),"leverage":lev,"liquidation":round(float(p["liquidationPrice"]),4)})
+        for p in active:
+            amt    = float(p["positionAmt"])
+            entry  = float(p["entryPrice"])
+            mark   = float(p["markPrice"])
+            pnl    = float(p["unRealizedProfit"])
+            lev    = int(p["leverage"])
+            side   = "LONG" if amt > 0 else "SHORT"
+            pct    = (pnl / (abs(amt) * entry / lev)) * 100 if entry > 0 else 0
+            result.append({"symbol":p["symbol"],"side":side,"size":round(abs(amt),4),"entry":round(entry,4),"mark":round(mark,4),"pnl":round(pnl,2),"pnlPct":round(pct,2),"leverage":lev,"liquidation":round(float(p["liquidationPrice"]),4)})
         return {"success":True,"positions":result}
     except HTTPException: raise
-    except Exception as e: raise HTTPException(status_code=500,detail=str(e))
+    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
-# ── Sinyal endpoint'i — tüm coinler için teknik analiz ────────────────────────
-SIGNALS_CACHE = {}
-SIGNALS_TIME  = 0
-
-@app.get("/api/signals")
-def signals(symbols: str = "BTC,ETH,SOL,BNB,INJ,HYPE,TAO,PEPE,NEAR,SUI,ARB,AVAX,STRK,LINK,PENDLE"):
-    global SIGNALS_CACHE, SIGNALS_TIME
-    now = time.time()
-    
-    # 5 dakika cache
-    if now - SIGNALS_TIME < 300 and SIGNALS_CACHE:
-        return {"success":True,"signals":SIGNALS_CACHE,"cached":True}
-    
-    sym_list = [s.strip().upper() for s in symbols.split(",")][:20]
-    results  = {}
-    for sym in sym_list:
-        try:
-            results[sym] = analyze_coin(sym)
-            time.sleep(0.1)  # Rate limit
-        except Exception as e:
-            results[sym] = {"symbol":sym,"score":50,"rec":"BEKLE","reasons":[],"error":str(e)}
-    
-    SIGNALS_CACHE = results
-    SIGNALS_TIME  = now
-    return {"success":True,"signals":results,"cached":False}
-
-@app.get("/api/signals/{symbol}")
-def signal_one(symbol: str):
-    return {"success":True,"signal":analyze_coin(symbol.upper())}
-
-# ── Haber endpoint'i ──────────────────────────────────────────────────────────
-import xml.etree.ElementTree as ET
-
-def fetch_rss(url, source_name, limit=8):
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent":"Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=10) as r:
-            content = r.read().decode("utf-8", errors="ignore")
-        root = ET.fromstring(content)
-        items = []
-        for item in root.findall(".//item")[:limit]:
-            title = item.findtext("title","").strip()
-            link  = item.findtext("link","").strip()
-            pub   = item.findtext("pubDate","").strip()
-            if title and link:
-                items.append({"title":title,"url":link,"source":source_name,
-                              "published":pub,"currencies":[],"positive":0,"negative":0})
-        return items
-    except Exception as e:
-        return []
-
-@app.get("/api/news")
-def news():
-    all_items = []
-    
-    # Kaynak 1: CoinTelegraph
-    items = fetch_rss("https://cointelegraph.com/rss", "CoinTelegraph", 6)
-    all_items.extend(items)
-    
-    # Kaynak 2: CoinDesk
-    if len(all_items) < 8:
-        items2 = fetch_rss("https://www.coindesk.com/arc/outboundfeeds/rss/", "CoinDesk", 6)
-        all_items.extend(items2)
-    
-    # Kaynak 3: Bitcoin Magazine
-    if len(all_items) < 10:
-        items3 = fetch_rss("https://bitcoinmagazine.com/feed", "Bitcoin Magazine", 4)
-        all_items.extend(items3)
-
-    # Kaynak 4: CryptoPanic (bonus)
-    try:
-        url = "https://cryptopanic.com/api/v1/posts/?auth_token=free&public=true&kind=news"
-        with urllib.request.urlopen(urllib.request.Request(url,headers={"User-Agent":"Mozilla/5.0"}), timeout=8) as r:
-            data = json.loads(r.read().decode())
-        for p in data.get("results",[])[:5]:
-            all_items.append({
-                "title":     p.get("title",""),
-                "url":       p.get("url",""),
-                "source":    p.get("source",{}).get("title","CryptoPanic"),
-                "published": p.get("published_at",""),
-                "currencies":[c["code"] for c in p.get("currencies",[])],
-                "positive":  p.get("votes",{}).get("positive",0),
-                "negative":  p.get("votes",{}).get("negative",0),
-            })
-    except: pass
-
-    return {"success": True, "news": all_items[:15]}
-
-# ── AI Analiz endpoint'i ─────────────────────────────────────────────────────
-CLAUDE_KEY = os.environ.get("CLAUDE_KEY", "")
-
-class AIRequest(BaseModel):
-    message: str
-    context: str = ""
-
-@app.post("/api/ai")
-def ai_analyze(req: AIRequest):
-    if not CLAUDE_KEY:
-        return {"success": False, "text": "CLAUDE_KEY eksik"}
-    try:
-        payload = json.dumps({
-            "model": "claude-sonnet-4-20250514",
-            "max_tokens": 500,
-            "system": """Sen KriptoAI'ın kişisel kripto trading asistanısın. Görevin: anlık piyasa verilerine bakarak EN İYİ altcoin fırsatını bulmak ve somut giriş/çıkış noktaları vermek.
-
-KURALLAR:
-- BTC ve ETH ÖNERME, sadece altcoin öner
-- Her zaman 1 veya 2 spesifik coin ismi ver
-- Giriş fiyatı, stop-loss ve hedef söyle
-- Kısa ve net yaz, maksimum 100 kelime
-- Markdown kullanma, düz metin
-- "genel olarak" veya "piyasa koşullarına göre" gibi muğlak cümleler KURMA
-- Somut ol: "X coini al, giriş Y$, stop Z$, hedef W$"
-""" + (f"\n\nŞu anki teknik sinyaller (Binance canlı veri):\n{req.context}" if req.context else ""),
-            "messages": [{"role": "user", "content": req.message}]
-        }).encode("utf-8")
-
-        r = urllib.request.Request(
-            "https://api.anthropic.com/v1/messages",
-            data=payload,
-            headers={
-                "Content-Type": "application/json",
-                "x-api-key": CLAUDE_KEY,
-                "anthropic-version": "2023-06-01"
-            }
-        )
-        with urllib.request.urlopen(r, timeout=30) as res:
-            data = json.loads(res.read().decode("utf-8"))
-        return {"success": True, "text": data["content"][0]["text"]}
-    except urllib.error.HTTPError as e:
-        body = json.loads(e.read().decode("utf-8"))
-        return {"success": False, "text": "API hatası: " + body.get("error", {}).get("message", str(e))}
-    except Exception as e:
-        return {"success": False, "text": "Hata: " + str(e)}
-
-# ── Fear & Greed Index ───────────────────────────────────────────────────────
-@app.get("/api/market-sentiment")
-def market_sentiment():
-    try:
-        # Fear & Greed Index (alternative.me - ücretsiz)
-        fng_url = "https://api.alternative.me/fng/?limit=7&format=json"
-        req = urllib.request.Request(fng_url, headers={"User-Agent":"Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=10) as r:
-            fng_data = json.loads(r.read().decode())
-        
-        fng = fng_data["data"][0]
-        fng_history = fng_data["data"][:7]
-        
-        # BTC dominance ve global market cap (CoinGecko)
-        global_data = {}
-        try:
-            gcko = urllib.request.Request(
-                "https://api.coingecko.com/api/v3/global",
-                headers={"User-Agent":"Mozilla/5.0"}
-            )
-            with urllib.request.urlopen(gcko, timeout=8) as r:
-                gd = json.loads(r.read().decode())["data"]
-                global_data = {
-                    "total_market_cap_usd": gd["total_market_cap"]["usd"],
-                    "total_volume_usd":     gd["total_volume"]["usd"],
-                    "btc_dominance":        round(gd["market_cap_percentage"]["btc"], 1),
-                    "eth_dominance":        round(gd["market_cap_percentage"].get("eth", 0), 1),
-                    "market_cap_change_24h":round(gd["market_cap_change_percentage_24h_usd"], 2),
-                }
-        except: pass
-
-        return {
-            "success": True,
-            "fear_greed": {
-                "value":       int(fng["value"]),
-                "label":       fng["value_classification"],
-                "label_tr":    {"Extreme Fear":"Aşırı Korku","Fear":"Korku","Neutral":"Nötr","Greed":"Açgözlülük","Extreme Greed":"Aşırı Açgözlülük"}.get(fng["value_classification"],"Nötr"),
-                "history":     [{"value":int(d["value"]),"label":d["value_classification"]} for d in fng_history],
-            },
-            "global": global_data
-        }
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-# ── Büyük İşlem Tespiti (Whale proxy) ────────────────────────────────────────
-@app.get("/api/whale-activity/{symbol}")
-def whale_activity(symbol: str):
-    try:
-        sym = symbol.upper() + "USDT"
-        # Son 100 büyük işlemi al
-        url = f"{BASE}/api/v3/trades?symbol={sym}&limit=200"
-        with urllib.request.urlopen(url, timeout=10) as r:
-            trades = json.loads(r.read().decode())
-        
-        # Fiyatı al
-        price_url = f"{BASE}/api/v3/ticker/price?symbol={sym}"
-        with urllib.request.urlopen(price_url, timeout=5) as r:
-            price = float(json.loads(r.read().decode())["price"])
-        
-        # Büyük işlemleri filtrele ($50k+)
-        whale_threshold = 50000
-        whale_trades = []
-        buy_volume = 0
-        sell_volume = 0
-        
-        for t in trades:
-            qty = float(t["qty"])
-            p   = float(t["price"])
-            val = qty * p
-            if val >= whale_threshold:
-                whale_trades.append({
-                    "time":  t["time"],
-                    "side":  "BUY" if not t["isBuyerMaker"] else "SELL",
-                    "value": round(val),
-                    "price": round(p, 6),
-                })
-                if not t["isBuyerMaker"]:
-                    buy_volume += val
-                else:
-                    sell_volume += val
-        
-        total = buy_volume + sell_volume
-        buy_pct = round(buy_volume/total*100) if total > 0 else 50
-        
-        return {
-            "success":     True,
-            "symbol":      sym,
-            "whale_trades":whale_trades[-10:],
-            "buy_volume":  round(buy_volume),
-            "sell_volume": round(sell_volume),
-            "buy_pct":     buy_pct,
-            "sentiment":   "BULLISH" if buy_pct > 60 else "BEARISH" if buy_pct < 40 else "NEUTRAL",
-            "count":       len(whale_trades)
-        }
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-# ── Backtest ──────────────────────────────────────────────────────────────────
-@app.get("/api/backtest/{symbol}")
-def backtest(symbol: str, days: int = 30):
-    try:
-        sym = symbol.upper() + "USDT"
-        # 1 saatlik mumlar — 30 gün = 720 mum
-        limit = min(days * 24, 1000)
-        url = f"{BASE}/api/v3/klines?symbol={sym}&interval=1h&limit={limit}"
-        with urllib.request.urlopen(url, timeout=15) as r:
-            klines = json.loads(r.read().decode())
-        
-        closes = [float(k[4]) for k in klines]
-        results = []
-        wins = 0
-        losses = 0
-        
-        # Her 24 saatte bir RSI hesapla, sinyal üretiliyorsa 24 saat sonraki fiyatla karşılaştır
-        for i in range(20, len(closes) - 24, 24):
-            window = closes[max(0,i-14):i+1]
-            rsi = 50
-            if len(window) >= 15:
-                gains = sum(max(0, window[j]-window[j-1]) for j in range(1,len(window)))
-                losses_sum = sum(max(0, window[j-1]-window[j]) for j in range(1,len(window)))
-                n = len(window)-1
-                if losses_sum/n > 0:
-                    rsi = round(100 - 100/(1 + (gains/n)/(losses_sum/n)))
-            
-            entry_price  = closes[i]
-            exit_price   = closes[i+24]  # 24 saat sonra
-            change_pct   = (exit_price - entry_price) / entry_price * 100
-            signal       = "AL" if rsi < 45 else "SAT" if rsi > 70 else "BEKLE"
-            
-            if signal in ("AL", "SAT"):
-                success = (signal=="AL" and change_pct > 0) or (signal=="SAT" and change_pct < 0)
-                if success: wins += 1
-                else: losses += 1
-                results.append({
-                    "timestamp": klines[i][0],
-                    "signal":    signal,
-                    "entry":     round(entry_price, 4),
-                    "exit":      round(exit_price, 4),
-                    "change":    round(change_pct, 2),
-                    "success":   success
-                })
-        
-        total_signals = wins + losses
-        win_rate = round(wins/total_signals*100) if total_signals > 0 else 0
-        
-        # Toplam kâr/zarar simülasyonu ($1000 başlangıç)
-        capital = 1000
-        for r in results:
-            if r["signal"] == "AL":
-                capital *= (1 + r["change"]/100)
-            elif r["signal"] == "SAT":
-                capital *= (1 - r["change"]/100)
-        
-        return {
-            "success":       True,
-            "symbol":        sym,
-            "days":          days,
-            "total_signals": total_signals,
-            "wins":          wins,
-            "losses":        losses,
-            "win_rate":      win_rate,
-            "final_capital": round(capital, 2),
-            "profit_pct":    round((capital-1000)/10, 2),
-            "last_signals":  results[-10:]
-        }
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-# ── Emir endpoint'leri ────────────────────────────────────────────────────────
+# ── Emir modelleri ────────────────────────────────────────────────────────────
 class SpotOrder(BaseModel):
-    symbol:     str
-    side:       str
-    usdtAmount: float
-    price:      float
-    orderType:  str = "MARKET"
+    symbol:   str
+    side:     str   # BUY veya SELL
+    quantity: float
+    orderType: str = "MARKET"
+    price:    float = 0.0
 
 class FuturesOrder(BaseModel):
     symbol:     str
-    side:       str
+    side:       str    # BUY veya SELL
     quantity:   float
-    leverage:   int   = 5
-    orderType:  str   = "MARKET"
+    leverage:   int = 5
+    orderType:  str = "MARKET"
+    price:      float = 0.0
     stopLoss:   float = 0.0
     takeProfit: float = 0.0
 
+# ── Spot Emir ─────────────────────────────────────────────────────────────────
 @app.post("/api/order/spot")
 def spot_order(order: SpotOrder):
-    if not TRADE_KEY: raise HTTPException(status_code=400,detail="Trading key eksik")
+    if not TRADE_KEY:
+        raise HTTPException(status_code=400, detail="Trading key eksik")
     try:
-        sym = order.symbol.upper()+"USDT"
-        step,min_qty,min_notional = get_spot_filters(sym)
-        raw_qty = order.usdtAmount/order.price if order.price>0 else 0
-        qty = round_step(raw_qty, step)
-        if qty<min_qty: raise HTTPException(status_code=400,detail=f"Min miktar: {min_qty} {order.symbol}")
-        if qty*order.price<min_notional: raise HTTPException(status_code=400,detail=f"Min işlem: ${min_notional}")
-        result = req(BASE,"/api/v3/order",{"symbol":sym,"side":order.side.upper(),"type":"MARKET","quantity":qty},TRADE_KEY,TRADE_SECRET,"POST")
-        return {"success":True,"orderId":result["orderId"],"symbol":sym,"side":order.side,"qty":qty,"status":result["status"]}
+        sym = order.symbol.upper() + "USDT"
+        params = {"symbol":sym,"side":order.side.upper(),"type":order.orderType.upper(),"quantity":order.quantity}
+        if order.orderType.upper() == "LIMIT":
+            params["price"]    = order.price
+            params["timeInForce"] = "GTC"
+        result = req(BASE, "/api/v3/order", params, TRADE_KEY, TRADE_SECRET, "POST")
+        return {"success":True,"orderId":result["orderId"],"symbol":sym,"side":order.side,"qty":order.quantity,"status":result["status"]}
     except HTTPException: raise
-    except Exception as e: raise HTTPException(status_code=500,detail=str(e))
+    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
+# ── Futures Emir ──────────────────────────────────────────────────────────────
 @app.post("/api/futures/order")
 def futures_order(order: FuturesOrder):
-    if not TRADE_KEY: raise HTTPException(status_code=400,detail="Trading key eksik")
+    if not TRADE_KEY:
+        raise HTTPException(status_code=400, detail="Trading key eksik")
     try:
-        sym = order.symbol.upper()+"USDT"
-        step,_ = get_futures_filters(sym)
-        qty = round_step(order.quantity, step)
-        req(FUTURES_BASE,"/fapi/v1/leverage",{"symbol":sym,"leverage":order.leverage},TRADE_KEY,TRADE_SECRET,"POST")
-        result = req(FUTURES_BASE,"/fapi/v1/order",{"symbol":sym,"side":order.side.upper(),"type":"MARKET","quantity":qty},TRADE_KEY,TRADE_SECRET,"POST")
-        orders = [{"orderId":result["orderId"],"type":"Ana Emir","status":result["status"]}]
-        if order.stopLoss>0:
-            sl_side="SELL" if order.side.upper()=="BUY" else "BUY"
-            try:
-                sl=req(FUTURES_BASE,"/fapi/v1/order",{"symbol":sym,"side":sl_side,"type":"STOP_MARKET","stopPrice":round(order.stopLoss,4),"closePosition":"true"},TRADE_KEY,TRADE_SECRET,"POST")
-                orders.append({"orderId":sl["orderId"],"type":"Stop-Loss","status":sl["status"]})
-            except: pass
-        if order.takeProfit>0:
-            tp_side="SELL" if order.side.upper()=="BUY" else "BUY"
-            try:
-                tp=req(FUTURES_BASE,"/fapi/v1/order",{"symbol":sym,"side":tp_side,"type":"TAKE_PROFIT_MARKET","stopPrice":round(order.takeProfit,4),"closePosition":"true"},TRADE_KEY,TRADE_SECRET,"POST")
-                orders.append({"orderId":tp["orderId"],"type":"Take-Profit","status":tp["status"]})
-            except: pass
-        return {"success":True,"symbol":sym,"side":order.side,"leverage":order.leverage,"qty":qty,"orders":orders}
-    except HTTPException: raise
-    except Exception as e: raise HTTPException(status_code=500,detail=str(e))
+        sym = order.symbol.upper() + "USDT"
 
+        # Kaldıraç ayarla
+        req(FUTURES_BASE, "/fapi/v1/leverage", {"symbol":sym,"leverage":order.leverage}, TRADE_KEY, TRADE_SECRET, "POST")
+
+        # Ana emir
+        params = {"symbol":sym,"side":order.side.upper(),"type":order.orderType.upper(),"quantity":order.quantity}
+        if order.orderType.upper() == "LIMIT":
+            params["price"]       = order.price
+            params["timeInForce"] = "GTC"
+        result = req(FUTURES_BASE, "/fapi/v1/order", params, TRADE_KEY, TRADE_SECRET, "POST")
+
+        orders = [{"orderId":result["orderId"],"type":"Ana Emir","status":result["status"]}]
+
+        # Stop-loss
+        if order.stopLoss > 0:
+            sl_side = "SELL" if order.side.upper()=="BUY" else "BUY"
+            sl = req(FUTURES_BASE, "/fapi/v1/order", {"symbol":sym,"side":sl_side,"type":"STOP_MARKET","stopPrice":order.stopLoss,"closePosition":"true"}, TRADE_KEY, TRADE_SECRET, "POST")
+            orders.append({"orderId":sl["orderId"],"type":"Stop-Loss","status":sl["status"]})
+
+        # Take-profit
+        if order.takeProfit > 0:
+            tp_side = "SELL" if order.side.upper()=="BUY" else "BUY"
+            tp = req(FUTURES_BASE, "/fapi/v1/order", {"symbol":sym,"side":tp_side,"type":"TAKE_PROFIT_MARKET","stopPrice":order.takeProfit,"closePosition":"true"}, TRADE_KEY, TRADE_SECRET, "POST")
+            orders.append({"orderId":tp["orderId"],"type":"Take-Profit","status":tp["status"]})
+
+        return {"success":True,"symbol":sym,"side":order.side,"leverage":order.leverage,"qty":order.quantity,"orders":orders}
+    except HTTPException: raise
+    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
+
+# ── Pozisyon kapat ────────────────────────────────────────────────────────────
 @app.post("/api/futures/close/{symbol}")
 def close_position(symbol: str):
-    if not TRADE_KEY: raise HTTPException(status_code=400,detail="Trading key eksik")
+    if not TRADE_KEY:
+        raise HTTPException(status_code=400, detail="Trading key eksik")
     try:
-        sym = symbol.upper()+"USDT"
-        positions = req(FUTURES_BASE,"/fapi/v2/positionRisk",{},TRADE_KEY,TRADE_SECRET)
-        pos = next((p for p in positions if p["symbol"]==sym and float(p["positionAmt"])!=0),None)
-        if not pos: raise HTTPException(status_code=404,detail="Açık pozisyon yok")
-        amt=float(pos["positionAmt"]); side="SELL" if amt>0 else "BUY"
-        step,_=get_futures_filters(sym); qty=round_step(abs(amt),step)
-        result=req(FUTURES_BASE,"/fapi/v1/order",{"symbol":sym,"side":side,"type":"MARKET","quantity":qty,"reduceOnly":"true"},TRADE_KEY,TRADE_SECRET,"POST")
-        return {"success":True,"message":sym+" kapatıldı","orderId":result["orderId"]}
+        sym = symbol.upper() + "USDT"
+        positions = req(FUTURES_BASE, "/fapi/v2/positionRisk", {}, TRADE_KEY, TRADE_SECRET)
+        pos = next((p for p in positions if p["symbol"]==sym and float(p["positionAmt"])!=0), None)
+        if not pos: raise HTTPException(status_code=404, detail="Açık pozisyon yok")
+        amt  = float(pos["positionAmt"])
+        side = "SELL" if amt > 0 else "BUY"
+        result = req(FUTURES_BASE, "/fapi/v1/order", {"symbol":sym,"side":side,"type":"MARKET","quantity":abs(amt),"reduceOnly":"true"}, TRADE_KEY, TRADE_SECRET, "POST")
+        return {"success":True,"message":sym+" pozisyon kapatıldı","orderId":result["orderId"]}
     except HTTPException: raise
-    except Exception as e: raise HTTPException(status_code=500,detail=str(e))
+    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
+
+# ── Gelişmiş Piyasa Analizi ───────────────────────────────────────────────────
+@app.get("/api/market-analysis")
+def market_analysis():
+    """Tüm coinler için detaylı piyasa analizi"""
+    try:
+        # 24h ticker data
+        tickers = get_pub("/api/v3/ticker/24hr")
+        
+        results = {}
+        for ticker in tickers:
+            if not ticker["symbol"].endswith("USDT"):
+                continue
+            
+            symbol = ticker["symbol"][:-4]  # BTCUSDT -> BTC
+            
+            # Hacim analizi
+            volume_usdt = float(ticker["quoteVolume"])
+            if volume_usdt < 1_000_000:  # Min 1M USDT hacim
+                continue
+            
+            # Fiyat değişimi
+            price_change = float(ticker["priceChangePercent"])
+            
+            # Order book analizi (sadece yüksek hacimli coinler için)
+            try:
+                depth = get_pub("/api/v3/depth", {"symbol": ticker["symbol"], "limit": 100})
+                
+                # Alım baskısı hesapla
+                bid_volume = sum(float(b[1]) * float(b[0]) for b in depth["bids"][:20])
+                ask_volume = sum(float(a[1]) * float(a[0]) for a in depth["asks"][:20])
+                
+                buy_pressure = bid_volume / ask_volume if ask_volume > 0 else 0
+                
+            except:
+                buy_pressure = 1.0
+            
+            results[symbol] = {
+                "price": float(ticker["lastPrice"]),
+                "change_24h": price_change,
+                "volume_24h": volume_usdt,
+                "buy_pressure": round(buy_pressure, 2),
+                "high_24h": float(ticker["highPrice"]),
+                "low_24h": float(ticker["lowPrice"]),
+                "trades": int(ticker["count"])
+            }
+        
+        return {"success": True, "data": results}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/smart-score/{symbol}")
+def smart_score(symbol: str):
+    """Coin için detaylı akıllı skor hesapla"""
+    try:
+        sym = symbol.upper() + "USDT"
+        
+        # 24h ticker
+        ticker = get_pub("/api/v3/ticker/24hr", {"symbol": sym})
+        
+        # Klines (mum verileri) - son 100 mum
+        klines = get_pub("/api/v3/klines", {
+            "symbol": sym,
+            "interval": "1h",
+            "limit": 100
+        })
+        
+        # RSI hesapla
+        closes = [float(k[4]) for k in klines]
+        rsi = calculate_rsi(closes, 14)
+        
+        # MACD hesapla
+        macd_line, signal_line = calculate_macd(closes)
+        macd_signal = 1 if macd_line > signal_line else -1
+        
+        # Bollinger Bands
+        bb_upper, bb_middle, bb_lower = calculate_bollinger(closes, 20, 2)
+        current_price = closes[-1]
+        
+        if current_price <= bb_lower * 1.02:
+            bb_position = -1  # Alt bant (AL)
+        elif current_price >= bb_upper * 0.98:
+            bb_position = 1   # Üst bant (SAT)
+        else:
+            bb_position = 0   # Orta
+        
+        # Order Book
+        try:
+            depth = get_pub("/api/v3/depth", {"symbol": sym, "limit": 100})
+            bid_volume = sum(float(b[1]) * float(b[0]) for b in depth["bids"][:20])
+            ask_volume = sum(float(a[1]) * float(a[0]) for a in depth["asks"][:20])
+            buy_pressure = bid_volume / ask_volume if ask_volume > 0 else 1.0
+        except:
+            buy_pressure = 1.0
+        
+        # Hacim analizi
+        avg_volume = sum(float(k[5]) for k in klines[-24:]) / 24
+        current_volume = float(ticker["quoteVolume"])
+        volume_ratio = current_volume / avg_volume if avg_volume > 0 else 1.0
+        
+        # SKOR HESAPLAMA
+        score = 50  # Başlangıç
+        reasons = []
+        
+        # 1. Teknik Analiz (25 puan)
+        if rsi < 30:
+            score += 10
+            reasons.append(f"RSI {rsi:.0f} aşırı satım")
+        elif rsi < 40:
+            score += 7
+            reasons.append(f"RSI {rsi:.0f} alım bölgesi")
+        elif rsi < 50:
+            score += 3
+        elif rsi > 70:
+            score -= 8
+            reasons.append(f"RSI {rsi:.0f} aşırı alım")
+        elif rsi > 60:
+            score -= 3
+        
+        if macd_signal == 1:
+            score += 8
+            reasons.append("MACD alım sinyali")
+        else:
+            score -= 5
+        
+        if bb_position == -1:
+            score += 7
+            reasons.append("BB alt bant (dip)")
+        elif bb_position == 1:
+            score -= 7
+            reasons.append("BB üst bant (zirve)")
+        
+        # 2. Alım/Satım Baskısı (15 puan)
+        if buy_pressure > 2.5:
+            score += 15
+            reasons.append(f"Güçlü alım baskısı {buy_pressure:.1f}x")
+        elif buy_pressure > 1.5:
+            score += 10
+            reasons.append(f"Alım baskısı {buy_pressure:.1f}x")
+        elif buy_pressure > 1.0:
+            score += 5
+        elif buy_pressure < 0.7:
+            score -= 10
+            reasons.append(f"Satış baskısı {buy_pressure:.1f}x")
+        
+        # 3. Hacim Artışı (10 puan)
+        if volume_ratio > 2.0:
+            score += 10
+            reasons.append(f"Hacim %{(volume_ratio-1)*100:.0f} arttı")
+        elif volume_ratio > 1.5:
+            score += 6
+            reasons.append(f"Hacim artışı {volume_ratio:.1f}x")
+        elif volume_ratio > 1.2:
+            score += 3
+        
+        # 4. Momentum (5 puan)
+        price_change = float(ticker["priceChangePercent"])
+        if price_change > 20:
+            score += 5
+            reasons.append(f"+%{price_change:.1f} güçlü yükseliş")
+        elif price_change > 10:
+            score += 4
+        elif price_change > 5:
+            score += 2
+        elif price_change < -10:
+            score -= 5
+            reasons.append(f"%{price_change:.1f} düşüş")
+        
+        # Limit
+        score = max(5, min(95, score))
+        
+        # Sinyal
+        if score >= 80:
+            signal = "GÜÇLÜ AL"
+        elif score >= 68:
+            signal = "AL"
+        elif score >= 55:
+            signal = "DİKKATLİ AL"
+        elif score >= 45:
+            signal = "BEKLE"
+        elif score >= 35:
+            signal = "SATIŞ"
+        else:
+            signal = "SAT"
+        
+        return {
+            "success": True,
+            "symbol": symbol,
+            "score": round(score),
+            "signal": signal,
+            "reasons": reasons[:4],
+            "indicators": {
+                "rsi": round(rsi, 1),
+                "macd": macd_signal,
+                "bb_position": bb_position,
+                "buy_pressure": round(buy_pressure, 2),
+                "volume_ratio": round(volume_ratio, 2),
+                "price_change": round(price_change, 2)
+            }
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ── Teknik Gösterge Hesaplamaları ─────────────────────────────────────────────
+def calculate_rsi(prices, period=14):
+    """RSI hesapla"""
+    if len(prices) < period + 1:
+        return 50
+    
+    deltas = [prices[i] - prices[i-1] for i in range(1, len(prices))]
+    gains = [d if d > 0 else 0 for d in deltas]
+    losses = [-d if d < 0 else 0 for d in deltas]
+    
+    avg_gain = sum(gains[-period:]) / period
+    avg_loss = sum(losses[-period:]) / period
+    
+    if avg_loss == 0:
+        return 100
+    
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+def calculate_macd(prices, fast=12, slow=26, signal=9):
+    """MACD hesapla"""
+    if len(prices) < slow:
+        return 0, 0
+    
+    def ema(data, period):
+        k = 2 / (period + 1)
+        ema_val = data[0]
+        for price in data[1:]:
+            ema_val = price * k + ema_val * (1 - k)
+        return ema_val
+    
+    ema_fast = ema(prices[-fast:], fast)
+    ema_slow = ema(prices[-slow:], slow)
+    macd_line = ema_fast - ema_slow
+    
+    macd_history = []
+    for i in range(slow, len(prices)):
+        ef = ema(prices[i-fast:i], fast)
+        es = ema(prices[i-slow:i], slow)
+        macd_history.append(ef - es)
+    
+    signal_line = ema(macd_history[-signal:], signal) if len(macd_history) >= signal else macd_line
+    
+    return macd_line, signal_line
+
+def calculate_bollinger(prices, period=20, std_dev=2):
+    """Bollinger Bands hesapla"""
+    if len(prices) < period:
+        return prices[-1] * 1.02, prices[-1], prices[-1] * 0.98
+    
+    recent = prices[-period:]
+    middle = sum(recent) / period
+    
+    variance = sum((p - middle) ** 2 for p in recent) / period
+    std = variance ** 0.5
+    
+    upper = middle + (std * std_dev)
+    lower = middle - (std * std_dev)
+    
+    return upper, middle, lower
