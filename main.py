@@ -208,14 +208,60 @@ def close_position(symbol: str):
 
 @app.get("/api/news")
 def get_news():
-    """Kripto haberlerini CoinGecko'dan çek"""
+    """Kripto haberlerini çeşitli kaynaklardan çek"""
+    
+    # Kaynak 1: CryptoCompare (Rate limit daha generous)
     try:
-        # CoinGecko News API (ücretsiz)
-        url = "https://api.coingecko.com/api/v3/news"
-        with urllib.request.urlopen(url, timeout=10) as response:
+        url = "https://min-api.cryptocompare.com/data/v2/news/?lang=EN"
+        with urllib.request.urlopen(url, timeout=8) as response:
             data = json.loads(response.read().decode("utf-8"))
         
-        # Formatla
+        if data.get("Data"):
+            news = []
+            for item in data["Data"][:15]:
+                news.append({
+                    "title": item.get("title", ""),
+                    "url": item.get("url", "#"),
+                    "source": item.get("source", "CryptoCompare"),
+                    "published": str(item.get("published_on", "")),
+                    "currencies": [],
+                    "positive": 0,
+                    "negative": 0
+                })
+            
+            if len(news) > 0:
+                return {"success": True, "news": news, "source": "cryptocompare"}
+    except:
+        pass
+    
+    # Kaynak 2: CoinPaprika
+    try:
+        url = "https://api.coinpaprika.com/v1/global"
+        with urllib.request.urlopen(url, timeout=8) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        
+        # CoinPaprika'da doğrudan haber yok, global piyasa verisinden basit haber oluştur
+        news = [{
+            "title": f"Bitcoin Market Cap: ${data.get('market_cap_usd', 0) / 1e9:.1f}B | 24h Vol: ${data.get('volume_24h_usd', 0) / 1e9:.1f}B",
+            "url": "https://coinpaprika.com",
+            "source": "CoinPaprika",
+            "published": str(int(time.time())),
+            "currencies": ["BTC"],
+            "positive": 1 if data.get('market_cap_change_24h', 0) > 0 else 0,
+            "negative": 1 if data.get('market_cap_change_24h', 0) < 0 else 0
+        }]
+        
+        if len(news) > 0:
+            return {"success": True, "news": news, "source": "coinpaprika"}
+    except:
+        pass
+    
+    # Kaynak 3: CoinGecko (fallback)
+    try:
+        url = "https://api.coingecko.com/api/v3/news"
+        with urllib.request.urlopen(url, timeout=8) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        
         news = []
         items = data.get("data", [])[:15] if isinstance(data, dict) else data[:15]
         
@@ -230,11 +276,13 @@ def get_news():
                 "negative": 0
             })
         
-        return {"success": True, "news": news, "source": "coingecko"}
+        if len(news) > 0:
+            return {"success": True, "news": news, "source": "coingecko"}
+    except:
+        pass
     
-    except Exception as e:
-        # Fallback: Boş liste döndür (frontend kendi kaynaklarını dener)
-        return {"success": False, "news": [], "error": str(e)}
+    # Tüm kaynaklar başarısız - frontend RSS'lere düşsün
+    return {"success": False, "news": [], "error": "All sources failed, frontend will use RSS fallbacks"}
 
 # ── Gelişmiş Piyasa Analizi ───────────────────────────────────────────────────
 @app.get("/api/market-analysis")
