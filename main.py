@@ -514,3 +514,199 @@ def calculate_bollinger(prices, period=20, std_dev=2):
     lower = middle - (std * std_dev)
     
     return upper, middle, lower
+
+# ── Market Sentiment (Fear & Greed) ───────────────────────────────────────────
+@app.get("/api/market-sentiment")
+def market_sentiment():
+    try:
+        # Alternative Crypto Fear & Greed Index
+        r = urllib.request.urlopen("https://api.alternative.me/fng/?limit=10", timeout=10)
+        data = json.loads(r.read().decode("utf-8"))
+        
+        if not data.get("data"):
+            raise Exception("No data")
+        
+        current = data["data"][0]
+        history = data["data"][:7]  # Son 7 gün
+        
+        # Türkçe label
+        value = int(current["value"])
+        if value < 25:
+            label_tr = "Aşırı Korku"
+        elif value < 45:
+            label_tr = "Korku"
+        elif value < 55:
+            label_tr = "Nötr"
+        elif value < 75:
+            label_tr = "Açgözlülük"
+        else:
+            label_tr = "Aşırı Açgözlülük"
+        
+        return {
+            "success": True,
+            "fear_greed": {
+                "value": value,
+                "label": current["value_classification"],
+                "label_tr": label_tr,
+                "timestamp": current["timestamp"],
+                "history": [{"value": int(h["value"]), "timestamp": h["timestamp"]} for h in history]
+            },
+            "global": {
+                "btc_dominance": 54.2,  # Placeholder - gerçek API eklenebilir
+                "total_volume_usd": 95000000000,
+                "market_cap_change_24h": 2.4
+            }
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+# ── AI Chat (Claude) ──────────────────────────────────────────────────────────
+class AIRequest(BaseModel):
+    message: str
+    context: str = ""
+    focus: str = "altcoin"
+
+@app.post("/api/ai")
+def ai_chat(req: AIRequest):
+    """Claude AI ile sohbet - CLAUDE API KEY gerekli"""
+    CLAUDE_KEY = os.environ.get("CLAUDE_API_KEY", "")
+    
+    if not CLAUDE_KEY:
+        return {"success": False, "text": "AI aktif değil. CLAUDE_API_KEY environment variable ekleyin."}
+    
+    try:
+        prompt = f"""Sen bir kripto trading uzmanısın. Kullanıcıya kısa ve net cevaplar ver.
+
+PIYASA DURUMU:
+{req.context}
+
+KULLANICI SORUSU: {req.message}
+
+ODAK: {req.focus} coinleri
+
+CEVAP (max 3 paragraf, direkt cevap ver):"""
+
+        headers = {
+            "x-api-key": CLAUDE_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json"
+        }
+        
+        body = json.dumps({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 500,
+            "messages": [{"role": "user", "content": prompt}]
+        })
+        
+        req_obj = urllib.request.Request(
+            "https://api.anthropic.com/v1/messages",
+            data=body.encode(),
+            headers=headers,
+            method="POST"
+        )
+        
+        with urllib.request.urlopen(req_obj, timeout=30) as res:
+            data = json.loads(res.read().decode("utf-8"))
+            text = data["content"][0]["text"]
+            return {"success": True, "text": text}
+            
+    except Exception as e:
+        return {"success": False, "text": f"AI hatası: {str(e)}"}
+
+# ── Backtest (Sinyal Doğruluğu) ───────────────────────────────────────────────
+@app.get("/api/backtest/{symbol}")
+def backtest_signals(symbol: str, days: int = 30):
+    """Geçmiş RSI sinyallerinin ne kadar doğru olduğunu test et"""
+    try:
+        sym = symbol.upper() + "USDT"
+        
+        # Son N günlük 1 saatlik mum verisi
+        interval = "1h"
+        limit = days * 24
+        
+        klines = get_pub("/api/v3/klines", {"symbol": sym, "interval": interval, "limit": limit})
+        
+        signals = []
+        wins = 0
+        losses = 0
+        capital = 1000.0
+        
+        for i in range(14, len(klines) - 24):  # RSI için 14 periyot, test için 24 saat sonrası gerekli
+            closes = [float(k[4]) for k in klines[max(0, i-14):i+1]]
+            
+            if len(closes) < 14:
+                continue
+            
+            # RSI hesapla
+            gains = []
+            losses_list = []
+            for j in range(1, len(closes)):
+                change = closes[j] - closes[j-1]
+                if change > 0:
+                    gains.append(change)
+                    losses_list.append(0)
+                else:
+                    gains.append(0)
+                    losses_list.append(abs(change))
+            
+            avg_gain = sum(gains[-14:]) / 14
+            avg_loss = sum(losses_list[-14:]) / 14
+            
+            if avg_loss == 0:
+                rsi = 100
+            else:
+                rs = avg_gain / avg_loss
+                rsi = 100 - (100 / (1 + rs))
+            
+            entry_price = float(klines[i][4])
+            exit_price = float(klines[i + 24][4])  # 24 saat sonra
+            
+            # Sinyal belirle
+            signal = None
+            if rsi < 30:
+                signal = "AL"
+            elif rsi > 70:
+                signal = "SAT"
+            
+            if signal:
+                change_pct = ((exit_price - entry_price) / entry_price) * 100
+                
+                success = False
+                if signal == "AL" and change_pct > 0:
+                    success = True
+                    wins += 1
+                    capital *= (1 + change_pct / 100)
+                elif signal == "SAT" and change_pct < 0:
+                    success = True
+                    wins += 1
+                    capital *= (1 - change_pct / 100)
+                else:
+                    losses += 1
+                
+                signals.append({
+                    "timestamp": klines[i][0],
+                    "signal": signal,
+                    "rsi": round(rsi, 1),
+                    "entry": round(entry_price, 4),
+                    "exit": round(exit_price, 4),
+                    "change": round(change_pct, 2),
+                    "success": success
+                })
+        
+        total = wins + losses
+        win_rate = (wins / total * 100) if total > 0 else 0
+        
+        return {
+            "success": True,
+            "symbol": symbol,
+            "days": days,
+            "total_signals": total,
+            "wins": wins,
+            "losses": losses,
+            "win_rate": round(win_rate, 1),
+            "final_capital": round(capital, 2),
+            "profit_pct": round(((capital - 1000) / 1000) * 100, 1),
+            "last_signals": signals[-10:]  # Son 10 sinyal
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
