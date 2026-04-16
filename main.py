@@ -206,11 +206,98 @@ def close_position(symbol: str):
     except HTTPException: raise
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/api/whale-activity")
+def whale_activity():
+    """Büyük işlemleri tespit et (whale tracking)"""
+    try:
+        # En yüksek hacimli coinler
+        top_coins = ["BTC", "ETH", "SOL", "BNB", "INJ", "AVAX", "NEAR", "HYPE"]
+        
+        whale_alerts = []
+        
+        for coin in top_coins:
+            symbol = coin + "USDT"
+            
+            try:
+                # Son işlemler
+                trades = get_pub("/api/v3/trades", {"symbol": symbol, "limit": 100})
+                
+                # Ortalama işlem büyüklüğü
+                avg_qty = sum(float(t["qty"]) for t in trades) / len(trades)
+                avg_value = sum(float(t["qty"]) * float(t["price"]) for t in trades) / len(trades)
+                
+                # Büyük işlemleri filtrele (ortalamadan 10x büyük)
+                large_trades = [
+                    t for t in trades 
+                    if float(t["qty"]) * float(t["price"]) > avg_value * 10
+                ]
+                
+                if large_trades:
+                    # En son büyük işlem
+                    recent = large_trades[0]
+                    value_usd = float(recent["qty"]) * float(recent["price"])
+                    
+                    # Sadece $100k üzeri işlemleri göster
+                    if value_usd >= 100000:
+                        whale_alerts.append({
+                            "coin": coin,
+                            "side": "BUY" if recent["isBuyerMaker"] else "SELL",
+                            "quantity": float(recent["qty"]),
+                            "price": float(recent["price"]),
+                            "value_usd": round(value_usd, 2),
+                            "timestamp": recent["time"],
+                            "size_ratio": round(value_usd / avg_value, 1),
+                            "alert_level": "🔴 Kritik" if value_usd > 1000000 else "🟡 Orta" if value_usd > 500000 else "🟢 Düşük"
+                        })
+            except:
+                continue
+        
+        # Değere göre sırala
+        whale_alerts.sort(key=lambda x: x["value_usd"], reverse=True)
+        
+        return {
+            "success": True,
+            "alerts": whale_alerts[:15],
+            "total_monitored": len(top_coins),
+            "last_update": int(time.time() * 1000)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+def analyze_sentiment(text):
+    """Basit sentiment analizi (pozitif/negatif kelimeler)"""
+    if not text:
+        return 0
+    
+    text = text.lower()
+    
+    positive_words = [
+        "bull", "bullish", "surge", "soar", "rally", "gain", "pump", "moon",
+        "breakthrough", "adoption", "partnership", "upgrade", "milestone",
+        "breakout", "recovery", "strong", "growth", "profit", "success"
+    ]
+    
+    negative_words = [
+        "bear", "bearish", "crash", "dump", "fall", "drop", "decline", "loss",
+        "hack", "scam", "fraud", "concern", "warning", "risk", "fear",
+        "plunge", "collapse", "weak", "sell-off", "failure", "ban"
+    ]
+    
+    pos_count = sum(1 for word in positive_words if word in text)
+    neg_count = sum(1 for word in negative_words if word in text)
+    
+    # -5 ile +5 arası skor
+    if pos_count > neg_count:
+        return min(5, pos_count - neg_count)
+    elif neg_count > pos_count:
+        return max(-5, pos_count - neg_count)
+    return 0
+
 @app.get("/api/news")
 def get_news():
     """Kripto haberlerini çeşitli kaynaklardan çek - DETAYLı LOGGING"""
     
-    errors = []  # Hata logları
+    errors = []
     
     # Kaynak 1: NewsAPI
     NEWS_API_KEY = os.environ.get("NEWS_API_KEY", "")
@@ -220,7 +307,6 @@ def get_news():
     
     if NEWS_API_KEY:
         try:
-            # URL encode query parametresi
             query = urllib.parse.quote("cryptocurrency OR bitcoin OR ethereum")
             url = f"https://newsapi.org/v2/everything?q={query}&language=en&sortBy=publishedAt&pageSize=15&apiKey={NEWS_API_KEY}"
             print(f"[NEWS] Trying NewsAPI...")
@@ -237,15 +323,20 @@ def get_news():
             if data.get("status") == "ok" and data.get("articles"):
                 news = []
                 for item in data["articles"][:15]:
+                    # Sentiment analizi
+                    title = item.get("title", "")
+                    desc = item.get("description", "")
+                    sentiment_score = analyze_sentiment(title + " " + desc)
+                    
                     news.append({
-                        "title": item.get("title", ""),
+                        "title": title,
                         "url": item.get("url", "#"),
                         "source": item.get("source", {}).get("name", "NewsAPI"),
                         "published": item.get("publishedAt", ""),
-                        "description": item.get("description", ""),
+                        "description": desc,
                         "currencies": [],
-                        "positive": 0,
-                        "negative": 0
+                        "sentiment": sentiment_score,
+                        "sentiment_label": "📈 Pozitif" if sentiment_score > 1 else "📉 Negatif" if sentiment_score < -1 else "⚪ Nötr"
                     })
                 
                 if len(news) > 0:
@@ -276,14 +367,19 @@ def get_news():
             if data.get("results"):
                 news = []
                 for item in data["results"][:15]:
+                    title = item.get("title", "")
+                    sentiment_score = analyze_sentiment(title)
+                    
                     news.append({
-                        "title": item.get("title", ""),
+                        "title": title,
                         "url": item.get("url", "#"),
                         "source": item.get("source", {}).get("title", "CryptoPanic"),
                         "published": item.get("published_at", ""),
                         "currencies": [c.get("code") for c in item.get("currencies", [])],
-                        "positive": 1 if item.get("votes", {}).get("positive", 0) > item.get("votes", {}).get("negative", 0) else 0,
-                        "negative": 1 if item.get("votes", {}).get("negative", 0) > item.get("votes", {}).get("positive", 0) else 0
+                        "sentiment": sentiment_score,
+                        "sentiment_label": "📈 Pozitif" if sentiment_score > 1 else "📉 Negatif" if sentiment_score < -1 else "⚪ Nötr",
+                        "votes_positive": item.get("votes", {}).get("positive", 0),
+                        "votes_negative": item.get("votes", {}).get("negative", 0)
                     })
                 
                 if len(news) > 0:
@@ -306,14 +402,17 @@ def get_news():
         items = data.get("data", [])[:15] if isinstance(data, dict) else data[:15]
         
         for item in items:
+            title = item.get("title", "")
+            sentiment_score = analyze_sentiment(title)
+            
             news.append({
-                "title": item.get("title", ""),
+                "title": title,
                 "url": item.get("url", "#"),
                 "source": item.get("author", {}).get("name", "CoinGecko") if isinstance(item.get("author"), dict) else "CoinGecko",
                 "published": item.get("created_at", ""),
                 "currencies": [],
-                "positive": 0,
-                "negative": 0
+                "sentiment": sentiment_score,
+                "sentiment_label": "📈 Pozitif" if sentiment_score > 1 else "📉 Negatif" if sentiment_score < -1 else "⚪ Nötr"
             })
         
         if len(news) > 0:
