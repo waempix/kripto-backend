@@ -220,8 +220,11 @@ def get_news():
     
     if NEWS_API_KEY:
         try:
-            url = f"https://newsapi.org/v2/everything?q=cryptocurrency OR bitcoin OR ethereum&language=en&sortBy=publishedAt&pageSize=15&apiKey={NEWS_API_KEY}"
+            # URL encode query parametresi
+            query = urllib.parse.quote("cryptocurrency OR bitcoin OR ethereum")
+            url = f"https://newsapi.org/v2/everything?q={query}&language=en&sortBy=publishedAt&pageSize=15&apiKey={NEWS_API_KEY}"
             print(f"[NEWS] Trying NewsAPI...")
+            print(f"[NEWS] URL: {url[:80]}...")
             
             req_obj = urllib.request.Request(url)
             req_obj.add_header('User-Agent', 'Mozilla/5.0')
