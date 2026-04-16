@@ -206,6 +206,36 @@ def close_position(symbol: str):
     except HTTPException: raise
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/api/news")
+def get_news():
+    """Kripto haberlerini CoinGecko'dan çek"""
+    try:
+        # CoinGecko News API (ücretsiz)
+        url = "https://api.coingecko.com/api/v3/news"
+        with urllib.request.urlopen(url, timeout=10) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        
+        # Formatla
+        news = []
+        items = data.get("data", [])[:15] if isinstance(data, dict) else data[:15]
+        
+        for item in items:
+            news.append({
+                "title": item.get("title", ""),
+                "url": item.get("url", "#"),
+                "source": item.get("author", {}).get("name", "CoinGecko") if isinstance(item.get("author"), dict) else "CoinGecko",
+                "published": item.get("created_at", ""),
+                "currencies": [],
+                "positive": 0,
+                "negative": 0
+            })
+        
+        return {"success": True, "news": news, "source": "coingecko"}
+    
+    except Exception as e:
+        # Fallback: Boş liste döndür (frontend kendi kaynaklarını dener)
+        return {"success": False, "news": [], "error": str(e)}
+
 # ── Gelişmiş Piyasa Analizi ───────────────────────────────────────────────────
 @app.get("/api/market-analysis")
 def market_analysis():
@@ -386,11 +416,13 @@ def smart_score(symbol: str):
         elif price_change < -8:
             score -= 4
         
-        # Limit - SIKLAŞTIRILDI
-        score = max(10, min(90, score))  # 5-95'ten 10-90'a
+        # Limit - Genişletildi
+        score = max(10, min(95, score))  # 10-95 arası (nadiren 90+ olur)
         
-        # Sinyal
-        if score >= 80:
+        # Sinyal - Genişletildi
+        if score >= 90:
+            signal = "ÇOK GÜÇLÜ AL"  # Nadiren olur
+        elif score >= 80:
             signal = "GÜÇLÜ AL"
         elif score >= 68:
             signal = "AL"
