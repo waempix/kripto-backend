@@ -143,6 +143,9 @@ def get_whale_transactions(symbol, api_key=None):
         return {
             "large_transactions": 0,
             "total_value_usd": 0,
+            "exchange_inflow": 0,
+            "exchange_outflow": 0,
+            "net_flow": 0,
             "whale_score": 0,
             "signal": "API KEY YOK"
         }
@@ -190,6 +193,9 @@ def get_whale_transactions(symbol, api_key=None):
         return {
             "large_transactions": 0,
             "total_value_usd": 0,
+            "exchange_inflow": 0,
+            "exchange_outflow": 0,
+            "net_flow": 0,
             "whale_score": 0,
             "signal": "HATA",
             "error": str(e)
