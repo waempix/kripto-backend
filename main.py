@@ -206,227 +206,44 @@ def close_position(symbol: str):
     except HTTPException: raise
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/api/whale-activity")
-def whale_activity():
-    """Büyük işlemleri tespit et (whale tracking)"""
-    try:
-        # En yüksek hacimli coinler
-        top_coins = ["BTC", "ETH", "SOL", "BNB", "INJ", "AVAX", "NEAR", "HYPE"]
-        
-        whale_alerts = []
-        
-        for coin in top_coins:
-            symbol = coin + "USDT"
-            
-            try:
-                # Son işlemler
-                trades = get_pub("/api/v3/trades", {"symbol": symbol, "limit": 100})
-                
-                # Ortalama işlem büyüklüğü
-                avg_qty = sum(float(t["qty"]) for t in trades) / len(trades)
-                avg_value = sum(float(t["qty"]) * float(t["price"]) for t in trades) / len(trades)
-                
-                # Büyük işlemleri filtrele (ortalamadan 10x büyük)
-                large_trades = [
-                    t for t in trades 
-                    if float(t["qty"]) * float(t["price"]) > avg_value * 10
-                ]
-                
-                if large_trades:
-                    # En son büyük işlem
-                    recent = large_trades[0]
-                    value_usd = float(recent["qty"]) * float(recent["price"])
-                    
-                    # Sadece $100k üzeri işlemleri göster
-                    if value_usd >= 100000:
-                        whale_alerts.append({
-                            "coin": coin,
-                            "side": "BUY" if recent["isBuyerMaker"] else "SELL",
-                            "quantity": float(recent["qty"]),
-                            "price": float(recent["price"]),
-                            "value_usd": round(value_usd, 2),
-                            "timestamp": recent["time"],
-                            "size_ratio": round(value_usd / avg_value, 1),
-                            "alert_level": "🔴 Kritik" if value_usd > 1000000 else "🟡 Orta" if value_usd > 500000 else "🟢 Düşük"
-                        })
-            except:
-                continue
-        
-        # Değere göre sırala
-        whale_alerts.sort(key=lambda x: x["value_usd"], reverse=True)
-        
-        return {
-            "success": True,
-            "alerts": whale_alerts[:15],
-            "total_monitored": len(top_coins),
-            "last_update": int(time.time() * 1000)
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-def analyze_sentiment(text):
-    """Basit sentiment analizi (pozitif/negatif kelimeler)"""
-    if not text:
-        return 0
-    
-    text = text.lower()
-    
-    positive_words = [
-        "bull", "bullish", "surge", "soar", "rally", "gain", "pump", "moon",
-        "breakthrough", "adoption", "partnership", "upgrade", "milestone",
-        "breakout", "recovery", "strong", "growth", "profit", "success"
-    ]
-    
-    negative_words = [
-        "bear", "bearish", "crash", "dump", "fall", "drop", "decline", "loss",
-        "hack", "scam", "fraud", "concern", "warning", "risk", "fear",
-        "plunge", "collapse", "weak", "sell-off", "failure", "ban"
-    ]
-    
-    pos_count = sum(1 for word in positive_words if word in text)
-    neg_count = sum(1 for word in negative_words if word in text)
-    
-    # -5 ile +5 arası skor
-    if pos_count > neg_count:
-        return min(5, pos_count - neg_count)
-    elif neg_count > pos_count:
-        return max(-5, pos_count - neg_count)
-    return 0
-
 @app.get("/api/news")
 def get_news():
-    """Kripto haberlerini çeşitli kaynaklardan çek - DETAYLı LOGGING"""
-    
-    errors = []
-    
-    # Kaynak 1: NewsAPI
-    NEWS_API_KEY = os.environ.get("NEWS_API_KEY", "")
-    
-    print(f"[NEWS] NEWS_API_KEY exists: {bool(NEWS_API_KEY)}")
-    print(f"[NEWS] NEWS_API_KEY length: {len(NEWS_API_KEY) if NEWS_API_KEY else 0}")
-    
-    if NEWS_API_KEY:
-        try:
-            query = urllib.parse.quote("cryptocurrency OR bitcoin OR ethereum")
-            url = f"https://newsapi.org/v2/everything?q={query}&language=en&sortBy=publishedAt&pageSize=15&apiKey={NEWS_API_KEY}"
-            print(f"[NEWS] Trying NewsAPI...")
-            print(f"[NEWS] URL: {url[:80]}...")
-            
-            req_obj = urllib.request.Request(url)
-            req_obj.add_header('User-Agent', 'Mozilla/5.0')
-            
-            with urllib.request.urlopen(req_obj, timeout=15) as response:
-                data = json.loads(response.read().decode("utf-8"))
-            
-            print(f"[NEWS] NewsAPI response status: {data.get('status')}")
-            
-            if data.get("status") == "ok" and data.get("articles"):
-                news = []
-                for item in data["articles"][:15]:
-                    # Sentiment analizi
-                    title = item.get("title", "")
-                    desc = item.get("description", "")
-                    sentiment_score = analyze_sentiment(title + " " + desc)
-                    
-                    news.append({
-                        "title": title,
-                        "url": item.get("url", "#"),
-                        "source": item.get("source", {}).get("name", "NewsAPI"),
-                        "published": item.get("publishedAt", ""),
-                        "description": desc,
-                        "currencies": [],
-                        "sentiment": sentiment_score,
-                        "sentiment_label": "📈 Pozitif" if sentiment_score > 1 else "📉 Negatif" if sentiment_score < -1 else "⚪ Nötr"
-                    })
-                
-                if len(news) > 0:
-                    print(f"[NEWS] NewsAPI SUCCESS: {len(news)} articles")
-                    return {"success": True, "news": news, "source": "newsapi"}
-        except urllib.error.HTTPError as e:
-            error_msg = f"NewsAPI HTTP {e.code}: {e.read().decode('utf-8')}"
-            print(f"[NEWS] NewsAPI HTTPError: {error_msg}")
-            errors.append(error_msg)
-        except Exception as e:
-            error_msg = f"NewsAPI Error: {type(e).__name__} - {str(e)}"
-            print(f"[NEWS] NewsAPI Exception: {error_msg}")
-            errors.append(error_msg)
-    else:
-        errors.append("NEWS_API_KEY not set")
-    
-    # Kaynak 2: CryptoPanic
-    CRYPTOPANIC_KEY = os.environ.get("CRYPTOPANIC_API_KEY", "")
-    
-    if CRYPTOPANIC_KEY:
-        try:
-            url = f"https://cryptopanic.com/api/v1/posts/?auth_token={CRYPTOPANIC_KEY}&public=true&kind=news"
-            print(f"[NEWS] Trying CryptoPanic...")
-            
-            with urllib.request.urlopen(url, timeout=10) as response:
-                data = json.loads(response.read().decode("utf-8"))
-            
-            if data.get("results"):
-                news = []
-                for item in data["results"][:15]:
-                    title = item.get("title", "")
-                    sentiment_score = analyze_sentiment(title)
-                    
-                    news.append({
-                        "title": title,
-                        "url": item.get("url", "#"),
-                        "source": item.get("source", {}).get("title", "CryptoPanic"),
-                        "published": item.get("published_at", ""),
-                        "currencies": [c.get("code") for c in item.get("currencies", [])],
-                        "sentiment": sentiment_score,
-                        "sentiment_label": "📈 Pozitif" if sentiment_score > 1 else "📉 Negatif" if sentiment_score < -1 else "⚪ Nötr",
-                        "votes_positive": item.get("votes", {}).get("positive", 0),
-                        "votes_negative": item.get("votes", {}).get("negative", 0)
-                    })
-                
-                if len(news) > 0:
-                    print(f"[NEWS] CryptoPanic SUCCESS: {len(news)} articles")
-                    return {"success": True, "news": news, "source": "cryptopanic"}
-        except Exception as e:
-            error_msg = f"CryptoPanic Error: {str(e)}"
-            print(f"[NEWS] {error_msg}")
-            errors.append(error_msg)
-    
-    # Kaynak 3: CoinGecko
+    """Kripto haberlerini CryptoCompare'den çek"""
     try:
-        url = "https://api.coingecko.com/api/v3/news"
-        print(f"[NEWS] Trying CoinGecko...")
+        # CryptoCompare News API (ücretsiz, CORS yok, rate limit cömert)
+        url = "https://min-api.cryptocompare.com/data/v2/news/?lang=EN"
         
-        with urllib.request.urlopen(url, timeout=10) as response:
+        req = urllib.request.Request(url)
+        req.add_header('User-Agent', 'Mozilla/5.0')
+        
+        with urllib.request.urlopen(req, timeout=10) as response:
             data = json.loads(response.read().decode("utf-8"))
         
+        # Formatla
         news = []
-        items = data.get("data", [])[:15] if isinstance(data, dict) else data[:15]
+        items = data.get("Data", [])[:20]
         
         for item in items:
-            title = item.get("title", "")
-            sentiment_score = analyze_sentiment(title)
+            # Coin tag'lerini parse et
+            tags = item.get("tags", "").split("|") if item.get("tags") else []
+            currencies = [t.upper() for t in tags if len(t) >= 2 and len(t) <= 5][:3]
             
             news.append({
-                "title": title,
-                "url": item.get("url", "#"),
-                "source": item.get("author", {}).get("name", "CoinGecko") if isinstance(item.get("author"), dict) else "CoinGecko",
-                "published": item.get("created_at", ""),
-                "currencies": [],
-                "sentiment": sentiment_score,
-                "sentiment_label": "📈 Pozitif" if sentiment_score > 1 else "📉 Negatif" if sentiment_score < -1 else "⚪ Nötr"
+                "title": item.get("title", ""),
+                "url": item.get("url", item.get("guid", "#")),
+                "source": item.get("source", "CryptoCompare"),
+                "published": item.get("published_on", 0),  # Unix timestamp
+                "currencies": currencies,
+                "positive": 0,
+                "negative": 0,
+                "imageurl": item.get("imageurl", "")
             })
         
-        if len(news) > 0:
-            print(f"[NEWS] CoinGecko SUCCESS: {len(news)} articles")
-            return {"success": True, "news": news, "source": "coingecko"}
-    except Exception as e:
-        error_msg = f"CoinGecko Error: {str(e)}"
-        print(f"[NEWS] {error_msg}")
-        errors.append(error_msg)
+        return {"success": True, "news": news, "source": "cryptocompare", "count": len(news)}
     
-    # Tüm kaynaklar başarısız
-    print(f"[NEWS] ALL SOURCES FAILED")
-    print(f"[NEWS] Errors: {errors}")
-    return {"success": False, "news": [], "error": "All sources failed", "details": errors}
+    except Exception as e:
+        # Fallback: Boş liste döndür
+        return {"success": False, "news": [], "error": str(e)}
 
 # ── Gelişmiş Piyasa Analizi ───────────────────────────────────────────────────
 @app.get("/api/market-analysis")
@@ -522,22 +339,25 @@ def smart_score(symbol: str):
         except:
             buy_pressure = 1.0
         
-        # Hacim analizi
+        # Hacim analizi - DÜZELTME
+        # Son 24 saatlik toplam hacim
         current_volume = float(ticker["quoteVolume"])
         
+        # Önceki 24 saatlik toplam hacim (48-24 saat arası)
         if len(klines) >= 48:
             prev_volume = sum(float(k[5]) for k in klines[-48:-24])
             volume_ratio = current_volume / prev_volume if prev_volume > 0 else 1.0
         else:
+            # Yeterli veri yoksa güncel ile son 24 saatin ortalamasını karşılaştır
             avg_hourly = sum(float(k[5]) for k in klines[-24:]) / 24
             current_hourly = float(klines[-1][5]) if klines else avg_hourly
             volume_ratio = current_hourly / avg_hourly if avg_hourly > 0 else 1.0
         
         # SKOR HESAPLAMA
-        score = 50
+        score = 50  # Başlangıç
         reasons = []
         
-        # Teknik Analiz
+        # 1. Teknik Analiz (max 25 puan) - SIKLAŞTIRILDI
         if rsi < 25:
             score += 15
             reasons.append(f"RSI {rsi:.0f} aşırı satım")
@@ -553,62 +373,64 @@ def smart_score(symbol: str):
             score -= 6
         
         if macd_signal == 1:
-            score += 6
+            score += 6  # 8'den 6'ya düşürüldü
             reasons.append("MACD alım sinyali")
         else:
-            score -= 4
+            score -= 4  # Daha sert ceza
         
         if bb_position == -1:
-            score += 8
+            score += 8  # 7'den 8'e (sadece dip önemli)
             reasons.append("BB alt bant (dip)")
         elif bb_position == 1:
-            score -= 10
+            score -= 10  # 7'den 10'a (zirve tehlikeli)
             reasons.append("BB üst bant (zirve)")
         
-        # Alım/Satım Baskısı
-        if buy_pressure > 3.0:
+        # 2. Alım/Satım Baskısı (max 15 puan) - SIKLAŞTIRILDI
+        if buy_pressure > 3.0:  # 2.5'ten 3.0'a
             score += 15
             reasons.append(f"Çok güçlü alım {buy_pressure:.1f}x")
-        elif buy_pressure > 2.0:
+        elif buy_pressure > 2.0:  # 1.5'ten 2.0'a
             score += 10
             reasons.append(f"Güçlü alım {buy_pressure:.1f}x")
-        elif buy_pressure > 1.3:
+        elif buy_pressure > 1.3:  # 1.0'dan 1.3'e
             score += 5
-        elif buy_pressure < 0.6:
-            score -= 12
+        elif buy_pressure < 0.6:  # 0.7'den 0.6'ya
+            score -= 12  # 10'dan 12'ye
             reasons.append(f"Güçlü satış {buy_pressure:.1f}x")
         elif buy_pressure < 0.85:
             score -= 5
         
-        # Hacim Artışı
-        if volume_ratio > 2.5:
+        # 3. Hacim Artışı (max 10 puan) - SIKLAŞTIRILDI
+        if volume_ratio > 2.5:  # 2.0'dan 2.5'e
             score += 10
             reasons.append(f"Hacim %{(volume_ratio-1)*100:.0f} arttı")
-        elif volume_ratio > 1.8:
+        elif volume_ratio > 1.8:  # 1.5'ten 1.8'e
             score += 6
-        elif volume_ratio > 1.3:
+        elif volume_ratio > 1.3:  # 1.2'den 1.3'e
             score += 3
-        elif volume_ratio < 0.7:
+        elif volume_ratio < 0.7:  # Düşük hacim cezası
             score -= 4
         
-        # Momentum
+        # 4. Momentum (max 5 puan) - SIKLAŞTIRILDI
         price_change = float(ticker["priceChangePercent"])
-        if price_change > 25:
+        if price_change > 25:  # 20'den 25'e
             score += 5
-        elif price_change > 15:
+        elif price_change > 15:  # 10'dan 15'e
             score += 3
         elif price_change > 8:
             score += 2
-        elif price_change < -15:
-            score -= 8
+        elif price_change < -15:  # -10'dan -15'e
+            score -= 8  # 5'ten 8'e
             reasons.append(f"%{price_change:.1f} düşüş")
         elif price_change < -8:
             score -= 4
         
-        score = max(10, min(95, score))
+        # Limit - Genişletildi
+        score = max(10, min(95, score))  # 10-95 arası (nadiren 90+ olur)
         
+        # Sinyal - Genişletildi
         if score >= 90:
-            signal = "ÇOK GÜÇLÜ AL"
+            signal = "ÇOK GÜÇLÜ AL"  # Nadiren olur
         elif score >= 80:
             signal = "GÜÇLÜ AL"
         elif score >= 68:
@@ -701,194 +523,3 @@ def calculate_bollinger(prices, period=20, std_dev=2):
     lower = middle - (std * std_dev)
     
     return upper, middle, lower
-
-# ── Market Sentiment (Fear & Greed) ───────────────────────────────────────────
-@app.get("/api/market-sentiment")
-def market_sentiment():
-    try:
-        # Alternative Crypto Fear & Greed Index
-        r = urllib.request.urlopen("https://api.alternative.me/fng/?limit=10", timeout=10)
-        data = json.loads(r.read().decode("utf-8"))
-        
-        if not data.get("data"):
-            raise Exception("No data")
-        
-        current = data["data"][0]
-        history = data["data"][:7]
-        
-        value = int(current["value"])
-        if value < 25:
-            label_tr = "Aşırı Korku"
-        elif value < 45:
-            label_tr = "Korku"
-        elif value < 55:
-            label_tr = "Nötr"
-        elif value < 75:
-            label_tr = "Açgözlülük"
-        else:
-            label_tr = "Aşırı Açgözlülük"
-        
-        return {
-            "success": True,
-            "fear_greed": {
-                "value": value,
-                "label": current["value_classification"],
-                "label_tr": label_tr,
-                "timestamp": current["timestamp"],
-                "history": [{"value": int(h["value"]), "timestamp": h["timestamp"]} for h in history]
-            },
-            "global": {
-                "btc_dominance": 54.2,
-                "total_volume_usd": 95000000000,
-                "market_cap_change_24h": 2.4
-            }
-        }
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-# ── AI Chat (Claude) ──────────────────────────────────────────────────────────
-class AIRequest(BaseModel):
-    message: str
-    context: str = ""
-    focus: str = "altcoin"
-
-@app.post("/api/ai")
-def ai_chat(req: AIRequest):
-    """Claude AI ile sohbet"""
-    CLAUDE_KEY = os.environ.get("CLAUDE_API_KEY", "")
-    
-    if not CLAUDE_KEY:
-        return {"success": False, "text": "AI aktif değil. CLAUDE_API_KEY environment variable ekleyin."}
-    
-    try:
-        prompt = f"""Sen bir kripto trading uzmanısın. Kullanıcıya kısa ve net cevaplar ver.
-
-PIYASA DURUMU:
-{req.context}
-
-KULLANICI SORUSU: {req.message}
-
-ODAK: {req.focus} coinleri
-
-CEVAP (max 3 paragraf):"""
-
-        headers = {
-            "x-api-key": CLAUDE_KEY,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json"
-        }
-        
-        body = json.dumps({
-            "model": "claude-3-5-sonnet-20241022",
-            "max_tokens": 500,
-            "messages": [{"role": "user", "content": prompt}]
-        })
-        
-        req_obj = urllib.request.Request(
-            "https://api.anthropic.com/v1/messages",
-            data=body.encode(),
-            headers=headers,
-            method="POST"
-        )
-        
-        with urllib.request.urlopen(req_obj, timeout=30) as res:
-            data = json.loads(res.read().decode("utf-8"))
-            text = data["content"][0]["text"]
-            return {"success": True, "text": text}
-            
-    except Exception as e:
-        return {"success": False, "text": f"AI hatası: {str(e)}"}
-
-# ── Backtest ──────────────────────────────────────────────────────────────────
-@app.get("/api/backtest/{symbol}")
-def backtest_signals(symbol: str, days: int = 30):
-    """Geçmiş RSI sinyallerinin doğruluğunu test et"""
-    try:
-        sym = symbol.upper() + "USDT"
-        interval = "1h"
-        limit = days * 24
-        
-        klines = get_pub("/api/v3/klines", {"symbol": sym, "interval": interval, "limit": limit})
-        
-        signals = []
-        wins = 0
-        losses = 0
-        capital = 1000.0
-        
-        for i in range(14, len(klines) - 24):
-            closes = [float(k[4]) for k in klines[max(0, i-14):i+1]]
-            
-            if len(closes) < 14:
-                continue
-            
-            gains = []
-            losses_list = []
-            for j in range(1, len(closes)):
-                change = closes[j] - closes[j-1]
-                if change > 0:
-                    gains.append(change)
-                    losses_list.append(0)
-                else:
-                    gains.append(0)
-                    losses_list.append(abs(change))
-            
-            avg_gain = sum(gains[-14:]) / 14
-            avg_loss = sum(losses_list[-14:]) / 14
-            
-            if avg_loss == 0:
-                rsi = 100
-            else:
-                rs = avg_gain / avg_loss
-                rsi = 100 - (100 / (1 + rs))
-            
-            entry_price = float(klines[i][4])
-            exit_price = float(klines[i + 24][4])
-            
-            signal = None
-            if rsi < 30:
-                signal = "AL"
-            elif rsi > 70:
-                signal = "SAT"
-            
-            if signal:
-                change_pct = ((exit_price - entry_price) / entry_price) * 100
-                
-                success = False
-                if signal == "AL" and change_pct > 0:
-                    success = True
-                    wins += 1
-                    capital *= (1 + change_pct / 100)
-                elif signal == "SAT" and change_pct < 0:
-                    success = True
-                    wins += 1
-                    capital *= (1 - change_pct / 100)
-                else:
-                    losses += 1
-                
-                signals.append({
-                    "timestamp": klines[i][0],
-                    "signal": signal,
-                    "rsi": round(rsi, 1),
-                    "entry": round(entry_price, 4),
-                    "exit": round(exit_price, 4),
-                    "change": round(change_pct, 2),
-                    "success": success
-                })
-        
-        total = wins + losses
-        win_rate = (wins / total * 100) if total > 0 else 0
-        
-        return {
-            "success": True,
-            "symbol": symbol,
-            "days": days,
-            "total_signals": total,
-            "wins": wins,
-            "losses": losses,
-            "win_rate": round(win_rate, 1),
-            "final_capital": round(capital, 2),
-            "profit_pct": round(((capital - 1000) / 1000) * 100, 1),
-            "last_signals": signals[-10:]
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
