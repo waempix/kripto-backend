@@ -219,14 +219,21 @@ def get_news():
         with urllib.request.urlopen(req, timeout=10) as response:
             data = json.loads(response.read().decode("utf-8"))
         
+        # Data kontrolü
+        if not data or "Data" not in data or not isinstance(data.get("Data"), list):
+            raise Exception("CryptoCompare API format hatası")
+        
         # Formatla
         news = []
-        items = data.get("Data", [])[:20]
+        items = data["Data"][:20]
         
         for item in items:
             # Coin tag'lerini parse et
-            tags = item.get("tags", "").split("|") if item.get("tags") else []
-            currencies = [t.upper() for t in tags if len(t) >= 2 and len(t) <= 5][:3]
+            tags = item.get("tags", "")
+            if tags and isinstance(tags, str):
+                currencies = [t.upper() for t in tags.split("|") if len(t) >= 2 and len(t) <= 5][:3]
+            else:
+                currencies = []
             
             news.append({
                 "title": item.get("title", ""),
@@ -242,8 +249,9 @@ def get_news():
         return {"success": True, "news": news, "source": "cryptocompare", "count": len(news)}
     
     except Exception as e:
-        # Fallback: Boş liste döndür
-        return {"success": False, "news": [], "error": str(e)}
+        # Detaylı hata mesajı
+        import traceback
+        return {"success": False, "news": [], "error": str(e), "trace": traceback.format_exc()}
 
 # ── Gelişmiş Piyasa Analizi ───────────────────────────────────────────────────
 @app.get("/api/market-analysis")
