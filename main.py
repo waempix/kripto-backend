@@ -212,7 +212,8 @@ def get_news():
     try:
         # NewsAPI.org - Kripto haberleri
         api_key = "9b3eadd975b24497b940e46c2d3bb153"
-        url = f"https://newsapi.org/v2/everything?q=cryptocurrency OR bitcoin OR ethereum OR crypto&language=en&sortBy=publishedAt&pageSize=20&apiKey={api_key}"
+        # URL encode edilmiş query (%20 = boşluk)
+        url = f"https://newsapi.org/v2/everything?q=cryptocurrency%20OR%20bitcoin%20OR%20ethereum%20OR%20crypto&language=en&sortBy=publishedAt&pageSize=20&apiKey={api_key}"
         
         req = urllib.request.Request(url)
         req.add_header('User-Agent', 'Mozilla/5.0')
