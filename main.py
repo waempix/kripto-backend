@@ -208,10 +208,11 @@ def close_position(symbol: str):
 
 @app.get("/api/news")
 def get_news():
-    """Kripto haberlerini CryptoCompare'den çek"""
+    """Kripto haberlerini NewsAPI.org'dan çek"""
     try:
-        # CryptoCompare News API (ücretsiz, CORS yok, rate limit cömert)
-        url = "https://min-api.cryptocompare.com/data/v2/news/?lang=EN"
+        # NewsAPI.org - Kripto haberleri
+        api_key = "9b3eadd975b24497b940e46c2d3bb153"
+        url = f"https://newsapi.org/v2/everything?q=cryptocurrency OR bitcoin OR ethereum OR crypto&language=en&sortBy=publishedAt&pageSize=20&apiKey={api_key}"
         
         req = urllib.request.Request(url)
         req.add_header('User-Agent', 'Mozilla/5.0')
@@ -220,33 +221,41 @@ def get_news():
             data = json.loads(response.read().decode("utf-8"))
         
         # Data kontrolü
-        if not data or "Data" not in data or not isinstance(data.get("Data"), list):
-            raise Exception("CryptoCompare API format hatası")
+        if data.get("status") != "ok" or "articles" not in data:
+            raise Exception(f"NewsAPI hatası: {data.get('message', 'Bilinmeyen hata')}")
         
         # Formatla
         news = []
-        items = data["Data"][:20]
-        
-        for item in items:
-            # Coin tag'lerini parse et
-            tags = item.get("tags", "")
-            if tags and isinstance(tags, str):
-                currencies = [t.upper() for t in tags.split("|") if len(t) >= 2 and len(t) <= 5][:3]
-            else:
-                currencies = []
+        for article in data["articles"][:20]:
+            # Başlık veya açıklamadan coin isimlerini çıkar
+            text = (article.get("title", "") + " " + article.get("description", "")).upper()
+            currencies = []
+            for coin in ["BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "DOGE", "AVAX", "DOT", "MATIC"]:
+                if coin in text or f"${coin}" in text:
+                    currencies.append(coin)
+            
+            # Zaman parse et (ISO 8601 → unix timestamp)
+            published_at = article.get("publishedAt", "")
+            try:
+                from datetime import datetime
+                dt = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
+                timestamp = int(dt.timestamp())
+            except:
+                timestamp = 0
             
             news.append({
-                "title": item.get("title", ""),
-                "url": item.get("url", item.get("guid", "#")),
-                "source": item.get("source", "CryptoCompare"),
-                "published": item.get("published_on", 0),  # Unix timestamp
-                "currencies": currencies,
+                "title": article.get("title", ""),
+                "url": article.get("url", "#"),
+                "source": article.get("source", {}).get("name", "NewsAPI"),
+                "published": timestamp,
+                "currencies": currencies[:3],
                 "positive": 0,
                 "negative": 0,
-                "imageurl": item.get("imageurl", "")
+                "imageurl": article.get("urlToImage", ""),
+                "description": article.get("description", "")[:150]
             })
         
-        return {"success": True, "news": news, "source": "cryptocompare", "count": len(news)}
+        return {"success": True, "news": news, "source": "newsapi", "count": len(news)}
     
     except Exception as e:
         # Detaylı hata mesajı
