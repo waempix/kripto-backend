@@ -208,12 +208,13 @@ def close_position(symbol: str):
 
 @app.get("/api/news")
 def get_news():
-    """Kripto haberlerini NewsAPI.org'dan çek"""
+    """Kripto haberlerini NewsAPI.org'dan çek + Sentiment analizi"""
     try:
-        # NewsAPI.org - Kripto haberleri
+        # NewsAPI.org - Kripto odaklı query
         api_key = "9b3eadd975b24497b940e46c2d3bb153"
-        # URL encode edilmiş query (%20 = boşluk)
-        url = f"https://newsapi.org/v2/everything?q=cryptocurrency%20OR%20bitcoin%20OR%20ethereum%20OR%20crypto&language=en&sortBy=publishedAt&pageSize=20&apiKey={api_key}"
+        # Kripto + trading/market odaklı, casino/fintech dışında
+        query = "(bitcoin%20OR%20ethereum%20OR%20altcoin%20OR%20crypto%20OR%20BTC%20OR%20ETH)%20AND%20(price%20OR%20market%20OR%20trading%20OR%20rally%20OR%20crash)"
+        url = f"https://newsapi.org/v2/everything?q={query}&language=en&sortBy=publishedAt&pageSize=30&apiKey={api_key}"
         
         req = urllib.request.Request(url)
         req.add_header('User-Agent', 'Mozilla/5.0')
@@ -225,17 +226,70 @@ def get_news():
         if data.get("status") != "ok" or "articles" not in data:
             raise Exception(f"NewsAPI hatası: {data.get('message', 'Bilinmeyen hata')}")
         
+        # Sentiment kelimeleri
+        POSITIVE = ["surge", "surges", "rally", "rallies", "bullish", "gains", "soar", "soars", "moon", 
+                    "breakthrough", "adoption", "pump", "green", "rise", "rising", "higher", "ATH", "record"]
+        NEGATIVE = ["crash", "crashes", "plunge", "plunges", "bearish", "drop", "drops", "fall", "falls", 
+                    "ban", "bans", "hack", "hacks", "scam", "dump", "red", "decline", "lower", "selloff"]
+        
+        # Coin listesi (genişletilmiş)
+        COINS = ["BTC", "BITCOIN", "ETH", "ETHEREUM", "SOL", "SOLANA", "BNB", "BINANCE", "XRP", "RIPPLE",
+                 "ADA", "CARDANO", "DOGE", "DOGECOIN", "AVAX", "AVALANCHE", "DOT", "POLKADOT", "MATIC", "POLYGON",
+                 "LINK", "CHAINLINK", "UNI", "UNISWAP", "ATOM", "COSMOS", "LTC", "LITECOIN", "NEAR",
+                 "APT", "APTOS", "SUI", "ARB", "ARBITRUM", "OP", "OPTIMISM", "INJ", "INJECTIVE",
+                 "HYPE", "HYPERLIQUID", "TAO", "BITTENSOR", "PEPE", "SHIB", "BONK"]
+        
         # Formatla
         news = []
-        for article in data["articles"][:20]:
-            # Başlık veya açıklamadan coin isimlerini çıkar
-            text = (article.get("title", "") + " " + article.get("description", "")).upper()
-            currencies = []
-            for coin in ["BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "DOGE", "AVAX", "DOT", "MATIC"]:
-                if coin in text or f"${coin}" in text:
-                    currencies.append(coin)
+        for article in data["articles"][:30]:
+            title = article.get("title", "")
+            desc = article.get("description", "") or ""
+            text = (title + " " + desc).upper()
             
-            # Zaman parse et (ISO 8601 → unix timestamp)
+            # Coin tespit et
+            currencies = []
+            for coin in COINS:
+                if coin in text or f"${coin}" in text:
+                    # Normalize et (BITCOIN → BTC)
+                    if coin in ["BITCOIN"]: currencies.append("BTC")
+                    elif coin in ["ETHEREUM"]: currencies.append("ETH")
+                    elif coin in ["SOLANA"]: currencies.append("SOL")
+                    elif coin in ["BINANCE"]: currencies.append("BNB")
+                    elif coin in ["RIPPLE"]: currencies.append("XRP")
+                    elif coin in ["CARDANO"]: currencies.append("ADA")
+                    elif coin in ["DOGECOIN"]: currencies.append("DOGE")
+                    elif coin in ["AVALANCHE"]: currencies.append("AVAX")
+                    elif coin in ["POLKADOT"]: currencies.append("DOT")
+                    elif coin in ["POLYGON"]: currencies.append("MATIC")
+                    elif coin in ["CHAINLINK"]: currencies.append("LINK")
+                    elif coin in ["UNISWAP"]: currencies.append("UNI")
+                    elif coin in ["COSMOS"]: currencies.append("ATOM")
+                    elif coin in ["LITECOIN"]: currencies.append("LTC")
+                    elif coin in ["ARBITRUM"]: currencies.append("ARB")
+                    elif coin in ["OPTIMISM"]: currencies.append("OP")
+                    elif coin in ["INJECTIVE"]: currencies.append("INJ")
+                    elif coin in ["HYPERLIQUID"]: currencies.append("HYPE")
+                    elif coin in ["BITTENSOR"]: currencies.append("TAO")
+                    elif coin in ["APTOS"]: currencies.append("APT")
+                    else: currencies.append(coin)
+            
+            # Tekrar eden coinleri kaldır
+            currencies = list(set(currencies))[:5]
+            
+            # Sentiment analizi
+            text_lower = text.lower()
+            positive_count = sum(1 for w in POSITIVE if w in text_lower)
+            negative_count = sum(1 for w in NEGATIVE if w in text_lower)
+            
+            # Sentiment skoru (-1, 0, +1)
+            if positive_count > negative_count:
+                sentiment = 1
+            elif negative_count > positive_count:
+                sentiment = -1
+            else:
+                sentiment = 0
+            
+            # Zaman parse et
             published_at = article.get("publishedAt", "")
             try:
                 from datetime import datetime
@@ -244,22 +298,24 @@ def get_news():
             except:
                 timestamp = 0
             
-            news.append({
-                "title": article.get("title", ""),
-                "url": article.get("url", "#"),
-                "source": article.get("source", {}).get("name", "NewsAPI"),
-                "published": timestamp,
-                "currencies": currencies[:3],
-                "positive": 0,
-                "negative": 0,
-                "imageurl": article.get("urlToImage", ""),
-                "description": article.get("description", "")[:150]
-            })
+            # Sadece coin'li haberleri al (kripto odaklı)
+            if len(currencies) > 0:
+                news.append({
+                    "title": title,
+                    "url": article.get("url", "#"),
+                    "source": article.get("source", {}).get("name", "NewsAPI"),
+                    "published": timestamp,
+                    "currencies": currencies,
+                    "sentiment": sentiment,  # -1, 0, +1
+                    "positive": positive_count,
+                    "negative": negative_count,
+                    "imageurl": article.get("urlToImage", ""),
+                    "description": desc[:150]
+                })
         
         return {"success": True, "news": news, "source": "newsapi", "count": len(news)}
     
     except Exception as e:
-        # Detaylı hata mesajı
         import traceback
         return {"success": False, "news": [], "error": str(e), "trace": traceback.format_exc()}
 
@@ -541,3 +597,57 @@ def calculate_bollinger(prices, period=20, std_dev=2):
     lower = middle - (std * std_dev)
     
     return upper, middle, lower
+# ── Market Analysis Endpoints ─────────────────────────────────────────────────
+# Import market_analysis module
+import sys
+import os
+sys.path.append(os.path.dirname(__file__))
+
+try:
+    from market_analysis import get_volume_analysis, get_orderbook_depth, get_whale_transactions, get_market_analysis
+    MARKET_ANALYSIS_AVAILABLE = True
+except ImportError:
+    MARKET_ANALYSIS_AVAILABLE = False
+
+@app.get("/api/market/{symbol}")
+def market_analysis(symbol: str):
+    """Coin için market analizi - hacim, order book, whale"""
+    if not MARKET_ANALYSIS_AVAILABLE:
+        return {"success": False, "error": "market_analysis modülü yok"}
+    
+    try:
+        # Whale Alert API key (opsiyonel - env variable)
+        whale_api_key = os.environ.get("WHALE_ALERT_API_KEY", None)
+        
+        # Tüm analizleri al
+        analysis = get_market_analysis(symbol.upper(), whale_api_key)
+        
+        return {"success": True, **analysis}
+    
+    except Exception as e:
+        import traceback
+        return {"success": False, "error": str(e), "trace": traceback.format_exc()}
+
+@app.get("/api/volume/{symbol}")
+def volume_analysis(symbol: str):
+    """Sadece hacim analizi"""
+    if not MARKET_ANALYSIS_AVAILABLE:
+        return {"success": False, "error": "market_analysis modülü yok"}
+    
+    try:
+        result = get_volume_analysis(symbol.upper())
+        return {"success": True, "symbol": symbol.upper(), **result}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+@app.get("/api/orderbook/{symbol}")
+def orderbook_analysis(symbol: str):
+    """Sadece order book analizi"""
+    if not MARKET_ANALYSIS_AVAILABLE:
+        return {"success": False, "error": "market_analysis modülü yok"}
+    
+    try:
+        result = get_orderbook_depth(symbol.upper())
+        return {"success": True, "symbol": symbol.upper(), **result}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
