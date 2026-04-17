@@ -517,7 +517,20 @@ def backtest(symbol: str, days: int = 30):
 _whale_cache = {"ts": 0, "data": None}
 
 @app.get("/api/whale-activity")
-def whale_activity(min_usd: int = 100000):
+def whale_activity(min_usd: int = 25000):
+    """
+    Son 1 saatte Binance'de gerçekleşmiş BÜYÜK işlemleri tespit eder.
+
+    Yöntem: /api/v3/aggTrades — aynı taker order'ın aynı fiyattan aldığı tüm
+    parçaları tek satır olarak birleştirir. Gerçek "balina" emri budur.
+    Son 1 saatlik pencerede min_usd üstü işlemler "balina işlemi" sayılır.
+
+    ÖNCEKİ HATA: /api/v3/trades sadece son ~500 işlem döner (BTC için
+    ~30 saniyelik bir pencere). O kısa pencerede $100K+ tek işlem hemen
+    hemen hiç olmuyordu — sonuç: hep 0.
+
+    2 dakika cache.
+    """
     try:
         now = time.time()
         if _whale_cache["data"] and (now - _whale_cache["ts"]) < 120:
@@ -529,48 +542,64 @@ def whale_activity(min_usd: int = 100000):
         alerts = []
         totals = {}
 
+        # Son 1 saat: startTime = now - 60dk (ms cinsinden)
+        one_hour_ago_ms = int((now - 3600) * 1000)
+
         for sym in watch:
             try:
                 pair = sym + "USDT"
-                trades_list = get_pub("/api/v3/trades", {"symbol": pair, "limit": 500})
+                trades_list = get_pub("/api/v3/aggTrades", {
+                    "symbol":    pair,
+                    "startTime": one_hour_ago_ms,
+                    "limit":     1000,
+                })
                 big_buy = 0.0
                 big_sell = 0.0
                 count_big = 0
                 for t in trades_list:
-                    qty   = float(t["qty"])
-                    price = float(t["price"])
+                    qty   = float(t["q"])
+                    price = float(t["p"])
                     usd   = qty * price
                     if usd < min_usd: continue
                     count_big += 1
-                    if t.get("isBuyerMaker"): big_sell += usd
-                    else:                     big_buy  += usd
+                    # aggTrades'te "m" = was the buyer the maker?
+                    # True  → taker satıyor (agresif SAT)
+                    # False → taker alıyor (agresif AL)
+                    is_sell = bool(t.get("m"))
+                    if is_sell: big_sell += usd
+                    else:       big_buy  += usd
                     alerts.append({
                         "symbol": sym,
-                        "side":   "SAT" if t.get("isBuyerMaker") else "AL",
+                        "side":   "SAT" if is_sell else "AL",
                         "usd":    round(usd, 0),
                         "qty":    round(qty, 4),
                         "price":  round(price, 6),
-                        "time":   int(t["time"]),
+                        "time":   int(t["T"]),
                     })
                 net = big_buy - big_sell
+                # Küçük coinlerde eşik daha düşük olmalı (PEPE'de $250K hayal)
+                threshold = 100000 if sym in ("BTC","ETH","SOL","BNB") else 50000
                 totals[sym] = {
                     "big_buy_usd":  round(big_buy, 0),
                     "big_sell_usd": round(big_sell, 0),
                     "net_usd":      round(net, 0),
                     "count":        count_big,
-                    "sentiment":    "birikim" if net > 250000 else "dağıtım" if net < -250000 else "nötr",
+                    "sentiment":    "birikim" if net > threshold
+                                    else "dağıtım" if net < -threshold
+                                    else "nötr",
                 }
             except Exception:
                 continue
 
         alerts.sort(key=lambda a: a["time"], reverse=True)
-        alerts = alerts[:30]
+        alerts = alerts[:40]
 
         result = {
-            "success":   True,
-            "min_usd":   min_usd,
-            "alerts":    alerts,
-            "by_symbol": totals,
+            "success":    True,
+            "min_usd":    min_usd,
+            "window":     "60 dakika",
+            "alerts":     alerts,
+            "by_symbol":  totals,
         }
         _whale_cache.update({"ts": now, "data": result})
         return result
