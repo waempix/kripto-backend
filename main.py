@@ -629,7 +629,7 @@ def ai_chat(req_body: AIRequest):
             user_msg += "\n\nMevcut piyasa verileri:\n" + req_body.context
 
         body = json.dumps({
-            "model":      "claude-3-5-haiku-20241022",
+            "model":      "claude-haiku-4-5",
             "max_tokens": 700,
             "system":     system,
             "messages":   [{"role": "user", "content": user_msg}],
@@ -644,8 +644,16 @@ def ai_chat(req_body: AIRequest):
                 "anthropic-version": "2023-06-01",
             },
         )
-        with urllib.request.urlopen(r, timeout=30) as res:
-            data = json.loads(res.read().decode("utf-8"))
+        try:
+            with urllib.request.urlopen(r, timeout=30) as res:
+                data = json.loads(res.read().decode("utf-8"))
+        except urllib.error.HTTPError as he:
+            try:
+                err_body = json.loads(he.read().decode("utf-8"))
+                err_msg = err_body.get("error", {}).get("message", str(he))
+            except Exception:
+                err_msg = str(he)
+            return {"success": False, "text": f"Anthropic API hatası ({he.code}): {err_msg}"}
         text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
         return {"success": True, "text": text or "Yanıt alınamadı."}
     except Exception as e:
@@ -822,14 +830,31 @@ def sentiment_analysis(req: SentimentReq):
 
         # Haberleri filtrele — bu coinden bahsedenler
         relevant = []
-        name_map = {"BTC":"bitcoin","ETH":"ethereum","SOL":"solana","BNB":"binance",
-                    "XRP":"ripple","DOGE":"dogecoin","AVAX":"avalanche","LINK":"chainlink",
-                    "PEPE":"pepe","SHIB":"shiba","HYPE":"hyperliquid","TAO":"bittensor"}
-        name = name_map.get(sym, sym.lower())
+        name_map = {
+            "BTC":["bitcoin","btc"],          "ETH":["ethereum","ether","eth"],
+            "SOL":["solana","sol "],           "BNB":["binance","bnb"],
+            "XRP":["ripple","xrp"],           "DOGE":["dogecoin","doge"],
+            "AVAX":["avalanche","avax"],       "LINK":["chainlink","link"],
+            "PEPE":["pepe"],                   "SHIB":["shiba","shib"],
+            "HYPE":["hyperliquid","hype"],     "TAO":["bittensor","tao"],
+            "INJ":["injective","inj"],         "ARB":["arbitrum","arb"],
+            "OP":["optimism"," op "],          "NEAR":["near protocol","near"],
+            "APT":["aptos"],                   "SUI":["sui"],
+            "ADA":["cardano","ada"],           "DOT":["polkadot","dot"],
+            "MATIC":["polygon","matic"],       "POL":["polygon","pol"],
+            "LTC":["litecoin","ltc"],          "UNI":["uniswap","uni"],
+            "AAVE":["aave"],                   "BONK":["bonk"],
+            "WLD":["worldcoin","wld"],         "JUP":["jupiter","jup"],
+            "RENDER":["render","rndr"],        "FET":["fetch.ai","fet"],
+            "AKT":["akash"],                   "PENDLE":["pendle"],
+            "STRK":["starknet","strk"],        "IMX":["immutable"],
+        }
+        keywords = name_map.get(sym, [sym.lower()])
 
-        for n in req.news_list[:30]:
+        for n in req.news_list[:40]:
             title = (n.get("title") or "").lower()
-            if sym.lower() in title or name in title:
+            # Herhangi bir anahtar kelime geçerse eşleştir
+            if any(k in title for k in keywords):
                 relevant.append(n.get("title"))
 
         if len(relevant) == 0:
@@ -852,7 +877,7 @@ def sentiment_analysis(req: SentimentReq):
                   + '{"sentiment":"pozitif|negatif|nötr","score":0-100,"summary":"2-3 cümle Türkçe özet","topics":["konu1","konu2","konu3"]}')
 
         body = json.dumps({
-            "model":      "claude-3-5-haiku-20241022",
+            "model":      "claude-haiku-4-5",
             "max_tokens": 400,
             "system":     "Sen bir kripto piyasa analistisin. SADECE geçerli JSON döndür.",
             "messages":   [{"role": "user", "content": prompt}],
