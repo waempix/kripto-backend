@@ -760,3 +760,131 @@ def market_analysis_all():
         return {"success": True, "data": out}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# ══════════════════════════════════════════════════════════════════════════════
+#                  ENDPOINT: /api/telegram  (push notification)
+# ══════════════════════════════════════════════════════════════════════════════
+# Kullanım: Render env'e TELEGRAM_BOT_TOKEN ve TELEGRAM_CHAT_ID ekleyin.
+# Bot token almak için:
+#   1. Telegram'da @BotFather'a /newbot yaz
+#   2. İsim ver, token alırsın
+#   3. Bot'a bir mesaj at, sonra https://api.telegram.org/bot<TOKEN>/getUpdates
+#      ziyaret et, chat_id buradan al
+TG_TOKEN    = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TG_CHAT_ID  = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+class TelegramMsg(BaseModel):
+    text:    str
+    silent:  bool = False
+
+@app.post("/api/telegram")
+def telegram_send(msg: TelegramMsg):
+    if not TG_TOKEN or not TG_CHAT_ID:
+        return {"success": False, "error": "Telegram yapılandırılmamış. Render env'e TELEGRAM_BOT_TOKEN ve TELEGRAM_CHAT_ID ekleyin."}
+    try:
+        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+        payload = {
+            "chat_id":              TG_CHAT_ID,
+            "text":                 msg.text,
+            "parse_mode":           "Markdown",
+            "disable_notification": msg.silent,
+        }
+        data = urllib.parse.urlencode(payload).encode("utf-8")
+        req  = urllib.request.Request(url, data=data)
+        with urllib.request.urlopen(req, timeout=10) as res:
+            body = json.loads(res.read().decode("utf-8"))
+        return {"success": body.get("ok", False)}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#                  ENDPOINT: /api/sentiment-analysis  (Claude + haberler)
+# ══════════════════════════════════════════════════════════════════════════════
+# Verilen coin'in güncel haberlerini toplayıp Claude ile sentiment analizi yapar.
+# Çıktı: pozitif/negatif/nötr + özet + önemli konular
+_sentiment_cache = {}  # sym → (ts, result)
+
+class SentimentReq(BaseModel):
+    symbol:    str
+    news_list: list = []  # frontend'den zaten çekilmiş haberler
+
+@app.post("/api/sentiment-analysis")
+def sentiment_analysis(req: SentimentReq):
+    if not CLAUDE_API_KEY:
+        return {"success": False, "error": "Claude API key eksik"}
+    try:
+        sym = req.symbol.upper()
+        # 30 dakika cache
+        if sym in _sentiment_cache:
+            ts, cached = _sentiment_cache[sym]
+            if time.time() - ts < 1800:
+                return cached
+
+        # Haberleri filtrele — bu coinden bahsedenler
+        relevant = []
+        name_map = {"BTC":"bitcoin","ETH":"ethereum","SOL":"solana","BNB":"binance",
+                    "XRP":"ripple","DOGE":"dogecoin","AVAX":"avalanche","LINK":"chainlink",
+                    "PEPE":"pepe","SHIB":"shiba","HYPE":"hyperliquid","TAO":"bittensor"}
+        name = name_map.get(sym, sym.lower())
+
+        for n in req.news_list[:30]:
+            title = (n.get("title") or "").lower()
+            if sym.lower() in title or name in title:
+                relevant.append(n.get("title"))
+
+        if len(relevant) == 0:
+            result = {
+                "success":  True,
+                "symbol":   sym,
+                "sentiment":"nötr",
+                "score":    50,
+                "summary":  f"{sym} ile ilgili güncel haber yok.",
+                "topics":   [],
+                "news_count": 0,
+            }
+            _sentiment_cache[sym] = (time.time(), result)
+            return result
+
+        prompt = (f"Aşağıda {sym} ile ilgili güncel haber başlıkları var. "
+                  f"Bunları analiz et ve JSON olarak cevap ver:\n\n"
+                  + "\n".join(f"- {t}" for t in relevant[:15])
+                  + '\n\nSadece geçerli JSON döndür, başka hiçbir şey yazma:\n'
+                  + '{"sentiment":"pozitif|negatif|nötr","score":0-100,"summary":"2-3 cümle Türkçe özet","topics":["konu1","konu2","konu3"]}')
+
+        body = json.dumps({
+            "model":      "claude-3-5-haiku-20241022",
+            "max_tokens": 400,
+            "system":     "Sen bir kripto piyasa analistisin. SADECE geçerli JSON döndür.",
+            "messages":   [{"role": "user", "content": prompt}],
+        }).encode("utf-8")
+
+        r = urllib.request.Request(
+            "https://api.anthropic.com/v1/messages",
+            data=body,
+            headers={"content-type": "application/json", "x-api-key": CLAUDE_API_KEY, "anthropic-version": "2023-06-01"},
+        )
+        with urllib.request.urlopen(r, timeout=20) as res:
+            data = json.loads(res.read().decode("utf-8"))
+        text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text").strip()
+
+        # JSON'u parse et (bazen markdown bloğunda geliyor)
+        if "```" in text:
+            text = text.split("```")[1]
+            if text.startswith("json"):
+                text = text[4:]
+            text = text.strip()
+
+        parsed = json.loads(text)
+        result = {
+            "success":    True,
+            "symbol":     sym,
+            "sentiment":  parsed.get("sentiment", "nötr"),
+            "score":      int(parsed.get("score", 50)),
+            "summary":    parsed.get("summary", ""),
+            "topics":     parsed.get("topics", [])[:5],
+            "news_count": len(relevant),
+        }
+        _sentiment_cache[sym] = (time.time(), result)
+        return result
+    except Exception as e:
+        return {"success": False, "error": str(e)}
