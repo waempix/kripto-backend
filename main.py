@@ -913,3 +913,133 @@ def sentiment_analysis(req: SentimentReq):
         return result
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#                  ENDPOINT: /api/batch-sentiment
+# ══════════════════════════════════════════════════════════════════════════════
+# Birden çok coin için tek Claude çağrısı ile sentiment analizi.
+# Maliyet optimizasyonu: 30 coin × tek tek = $0.06, toplu = $0.003.
+_batch_sentiment_cache = {"ts": 0, "data": {}}
+
+class BatchSentimentReq(BaseModel):
+    symbols:   list          # ["BTC","ETH","SOL",...]
+    news_list: list = []     # global haber havuzu
+
+@app.post("/api/batch-sentiment")
+def batch_sentiment(req: BatchSentimentReq):
+    if not CLAUDE_API_KEY:
+        return {"success": False, "error": "Claude API key eksik"}
+    try:
+        # 15 dakika cache — çok sık çağrılmasın
+        now = time.time()
+        if req.symbols and now - _batch_sentiment_cache["ts"] < 900:
+            cached = _batch_sentiment_cache["data"]
+            # İstenen semboller cache'de varsa direkt dön
+            if all(s.upper() in cached for s in req.symbols):
+                return {"success": True, "cached": True, "sentiments": {s.upper(): cached[s.upper()] for s in req.symbols}}
+
+        # Her coin için relevant haberleri topla
+        name_map = {
+            "BTC":["bitcoin","btc"], "ETH":["ethereum","ether"],
+            "SOL":["solana"], "BNB":["binance","bnb"],
+            "XRP":["ripple","xrp"], "DOGE":["dogecoin","doge"],
+            "AVAX":["avalanche","avax"], "LINK":["chainlink"],
+            "PEPE":["pepe"], "SHIB":["shiba","shib"],
+            "HYPE":["hyperliquid"], "TAO":["bittensor","tao"],
+            "INJ":["injective","inj"], "ARB":["arbitrum"],
+            "OP":["optimism"], "NEAR":["near protocol","nearprotocol"],
+            "APT":["aptos"], "SUI":["sui network","suinetwork"],
+            "ADA":["cardano","ada"], "DOT":["polkadot"],
+            "MATIC":["polygon","matic"], "POL":["polygon","pol"],
+            "LTC":["litecoin"], "UNI":["uniswap"],
+            "AAVE":["aave"], "BONK":["bonk"],
+            "WLD":["worldcoin"], "JUP":["jupiter"],
+            "RENDER":["render network","rndr"], "FET":["fetch.ai"],
+            "AKT":["akash"], "PENDLE":["pendle"],
+            "STRK":["starknet"], "IMX":["immutable"],
+            "HBAR":["hedera"], "TRX":["tron"],
+            "ATOM":["cosmos"], "ETC":["ethereum classic"],
+            "FIL":["filecoin"], "ALGO":["algorand"],
+        }
+
+        # Her coin için haber sayısını ve başlıkları derle
+        per_coin_news = {}
+        for sym in req.symbols:
+            s = sym.upper()
+            keywords = name_map.get(s, [s.lower()])
+            relevant = []
+            for n in (req.news_list or [])[:50]:
+                title = (n.get("title") or "").lower()
+                if any(k in title for k in keywords):
+                    relevant.append(n.get("title"))
+            per_coin_news[s] = relevant[:5]  # her coin için max 5 haber
+
+        # Hiç haber olmayan coinler için doğrudan nötr dön, Claude'a sorma
+        result = {}
+        to_analyze = {}
+        for s, news in per_coin_news.items():
+            if len(news) == 0:
+                result[s] = {"sentiment":"nötr", "score":50, "news_count":0}
+            else:
+                to_analyze[s] = news
+
+        if len(to_analyze) == 0:
+            out = {"success": True, "cached": False, "sentiments": result}
+            return out
+
+        # Toplu prompt — tek Claude çağrısı, tüm coinleri birden analiz et
+        prompt_parts = ["Aşağıda kripto coinleri için güncel haber başlıkları var. "
+                        "Her coin için sentiment skoru (0-100), sentiment etiketi "
+                        "(pozitif/negatif/nötr) üret. SADECE aşağıdaki JSON formatında cevap ver:\n\n"]
+        for s, news in to_analyze.items():
+            prompt_parts.append(f"\n### {s}\n")
+            for n in news:
+                prompt_parts.append(f"- {n}\n")
+        prompt_parts.append(
+            '\n\nÇıktı formatı (başka HİÇ bir şey yazma):\n'
+            '{"BTC":{"sentiment":"pozitif","score":72},'
+            '"ETH":{"sentiment":"negatif","score":30}}\n'
+        )
+        prompt = "".join(prompt_parts)
+
+        body = json.dumps({
+            "model":      "claude-haiku-4-5",
+            "max_tokens": 800,
+            "system":     "Sen bir kripto piyasa analistisin. SADECE geçerli JSON döndür, markdown/açıklama yazma.",
+            "messages":   [{"role":"user","content":prompt}],
+        }).encode("utf-8")
+
+        r = urllib.request.Request(
+            "https://api.anthropic.com/v1/messages",
+            data=body,
+            headers={"content-type":"application/json","x-api-key":CLAUDE_API_KEY,"anthropic-version":"2023-06-01"},
+        )
+        try:
+            with urllib.request.urlopen(r, timeout=30) as res:
+                data = json.loads(res.read().decode("utf-8"))
+        except urllib.error.HTTPError as he:
+            return {"success": False, "error": f"Anthropic {he.code}: {he.read().decode('utf-8')[:200]}"}
+
+        text = "".join(b.get("text","") for b in data.get("content",[]) if b.get("type")=="text").strip()
+        if "```" in text:
+            text = text.split("```")[1]
+            if text.startswith("json"): text = text[4:]
+            text = text.strip()
+
+        parsed = json.loads(text)
+        for s, news in to_analyze.items():
+            if s in parsed:
+                result[s] = {
+                    "sentiment":  parsed[s].get("sentiment","nötr"),
+                    "score":      int(parsed[s].get("score",50)),
+                    "news_count": len(news),
+                }
+            else:
+                result[s] = {"sentiment":"nötr","score":50,"news_count":len(news)}
+
+        # Cache'e yaz
+        _batch_sentiment_cache["ts"]   = now
+        _batch_sentiment_cache["data"] = {**_batch_sentiment_cache.get("data",{}), **result}
+        return {"success": True, "cached": False, "sentiments": result, "analyzed": len(to_analyze)}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
