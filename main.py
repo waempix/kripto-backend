@@ -11,7 +11,7 @@ READ_SECRET    = os.environ.get("BINANCE_API_SECRET", "")
 TRADE_KEY      = os.environ.get("BINANCE_TRADE_KEY", "")
 TRADE_SECRET   = os.environ.get("BINANCE_TRADE_SECRET", "")
 NEWS_API_KEY   = os.environ.get("NEWS_API_KEY", "9b3eadd975b24497b940e46c2d3bb153")
-CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY", "")
+CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY", "") or os.environ.get("CLAUDE_KEY", "") or os.environ.get("ANTHROPIC_API_KEY", "")
 
 BASE         = "https://api.binance.com"
 FUTURES_BASE = "https://fapi.binance.com"
