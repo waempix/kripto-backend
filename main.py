@@ -287,16 +287,34 @@ def compute_smart_score(symbol, use_orderbook=True):
     elif buy_pressure < 0.6:  score -= 12; reasons.append(f"Güçlü satış {buy_pressure:.1f}x")
     elif buy_pressure < 0.85: score -= 5
 
+    # ── Hacim skorlama — zayıf hacimli yükselişler TUZAK olabilir ──
+    # Büyük hacim artışı = güçlü hareket (birikim veya panik satış)
+    # Düşük hacim = "kimse ilgilenmiyor" — dip yapsa bile alım gelmeyebilir
     if   vol_ratio > 2.5: score += 10; reasons.append(f"Hacim {vol_ratio:.1f}x arttı")
     elif vol_ratio > 1.8: score += 6;  reasons.append(f"Hacim {vol_ratio:.1f}x arttı")
     elif vol_ratio > 1.3: score += 3
-    elif vol_ratio < 0.7: score -= 4;  reasons.append(f"Hacim {vol_ratio:.1f}x düştü")
+    elif vol_ratio > 1.0: pass                                         # normal
+    elif vol_ratio > 0.8: score -= 3                                    # hafif zayıf
+    elif vol_ratio > 0.6: score -= 7;  reasons.append(f"Hacim {vol_ratio:.1f}x zayıf")
+    else:                 score -= 12; reasons.append(f"Hacim {vol_ratio:.1f}x çok zayıf")
 
     if   price_change > 25: score += 5
     elif price_change > 15: score += 3
     elif price_change > 8:  score += 2
     elif price_change < -15: score -= 8; reasons.append(f"%{price_change:.1f} düşüş")
     elif price_change < -8:  score -= 4
+
+    # ── BIÇAK YAKALAMA GUARDI ──
+    # Fiyat düşerken hacim de düşükse: kimse almıyor demek, dip burada DEĞİL.
+    # Klasik "bıçağı düşerken yakalama" tuzağı — bunu aktif engelliyoruz.
+    if price_change < -3 and vol_ratio < 1.0:
+        score -= 8
+        reasons.append("⚠️ Düşüşte zayıf hacim (bıçak tuzağı)")
+
+    # ── SATIŞ TARAFINDA BASKI + DÜŞÜŞ = kaçış sinyali ──
+    if buy_pressure < 0.9 and price_change < -3:
+        score -= 5
+        reasons.append("⚠️ Satış baskısı + düşüş")
 
     score = max(10, min(95, score))
 
