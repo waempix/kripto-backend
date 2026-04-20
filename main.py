@@ -223,7 +223,71 @@ def calc_bollinger(prices, period=20, std_dev=2):
 # ══════════════════════════════════════════════════════════════════════════════
 #              ORTAK SMART-SCORE HESAPLAYICI
 # ══════════════════════════════════════════════════════════════════════════════
-def compute_smart_score(symbol, use_orderbook=True):
+def calc_ema(values, period):
+    """Exponential Moving Average — son değere daha çok ağırlık verir."""
+    if len(values) < period:
+        return sum(values) / len(values) if values else 0.0
+    k = 2 / (period + 1)
+    ema = sum(values[:period]) / period  # SMA başlangıç
+    for v in values[period:]:
+        ema = v * k + ema * (1 - k)
+    return ema
+
+
+# ── PİYASA DURUMU CACHE ──────────────────────────────────────────────────────
+# BTC'nin 24 saat değişimi ve 4 saatlik trend durumu. Tüm sinyaller için
+# ortak filtre — 5 dakika cache ile aşırı API çağrısını önle.
+_market_state_cache = {"ts": 0, "state": None}
+
+def get_market_state():
+    """BTC'nin genel durumu — bearish/neutral/bullish."""
+    now = time.time()
+    if _market_state_cache["state"] and now - _market_state_cache["ts"] < 300:
+        return _market_state_cache["state"]
+    try:
+        # BTC 24h değişim
+        ticker = get_pub("/api/v3/ticker/24hr", {"symbol": "BTCUSDT"})
+        btc_24h = float(ticker["priceChangePercent"])
+
+        # BTC 4h trend: EMA20 vs EMA50 (son 100 4-saatlik mum)
+        klines_4h = get_pub("/api/v3/klines", {"symbol": "BTCUSDT", "interval": "4h", "limit": 100})
+        closes_4h = [float(k[4]) for k in klines_4h]
+        ema20_4h  = calc_ema(closes_4h, 20)
+        ema50_4h  = calc_ema(closes_4h, 50)
+        btc_trend = "bullish" if ema20_4h > ema50_4h else "bearish"
+
+        # Durum belirle
+        if btc_24h < -3.0:
+            state = "bearish"   # sert düşüş — risky, AL'lar filtrelenmeli
+        elif btc_24h < -1.5 and btc_trend == "bearish":
+            state = "bearish"
+        elif btc_24h > 2.0 and btc_trend == "bullish":
+            state = "bullish"
+        else:
+            state = "neutral"
+
+        result = {
+            "state":     state,
+            "btc_24h":   round(btc_24h, 2),
+            "btc_trend": btc_trend,
+            "ema20_4h":  round(ema20_4h, 2),
+            "ema50_4h":  round(ema50_4h, 2),
+        }
+        _market_state_cache["state"] = result
+        _market_state_cache["ts"]    = now
+        return result
+    except Exception as e:
+        # Hata durumunda nötr — filtre kapatma
+        return {"state": "neutral", "btc_24h": 0, "btc_trend": "unknown", "error": str(e)}
+
+
+@app.get("/api/market-state")
+def market_state_endpoint():
+    """Piyasa durumunu dışa aç — frontend de okusun istersen."""
+    return get_market_state()
+
+
+
     sym = symbol.upper() + "USDT"
     ticker = get_pub("/api/v3/ticker/24hr", {"symbol": sym})
     klines = get_pub("/api/v3/klines", {"symbol": sym, "interval": "1h", "limit": 100})
@@ -263,6 +327,20 @@ def compute_smart_score(symbol, use_orderbook=True):
     except Exception:
         vol_ratio = 1.0
     vol_ratio = max(0.1, min(20.0, vol_ratio))
+
+    # ── TREND DOĞRULAMA — coin'in kendi 4h EMA'sı ────────────────────────
+    # Coin'in teknik göstergeleri iyi olabilir ama trend hâlâ aşağıysa dip yapmamış.
+    # Yükseliş trendi için EMA20(4h) > EMA50(4h) şartı aranır.
+    own_trend = "unknown"
+    try:
+        klines_4h  = get_pub("/api/v3/klines", {"symbol": sym, "interval": "4h", "limit": 60})
+        closes_4h  = [float(k[4]) for k in klines_4h]
+        if len(closes_4h) >= 50:
+            own_ema20 = calc_ema(closes_4h, 20)
+            own_ema50 = calc_ema(closes_4h, 50)
+            own_trend = "bullish" if own_ema20 > own_ema50 else "bearish"
+    except Exception:
+        pass
 
     price_change = float(ticker["priceChangePercent"])
 
@@ -316,6 +394,26 @@ def compute_smart_score(symbol, use_orderbook=True):
         score -= 5
         reasons.append("⚠️ Satış baskısı + düşüş")
 
+    # ── PİYASA YÖNÜ FİLTRESİ — BTC düşüşte ise AL sinyalini yumuşat ──
+    # Altcoin'ler BTC'yi takip eder. BTC düşerken altcoin "AL fırsatı" çoğu zaman tuzak.
+    # Eski veri: 19 AL sinyali, %26 isabet — sebep: piyasa bearish iken AL verildi.
+    market = get_market_state()
+    if market["state"] == "bearish":
+        if score >= 68:
+            score = min(score, 64)  # AL → DİKKATLİ AL
+            reasons.append(f"⚠️ Piyasa bearish (BTC {market['btc_24h']:+.1f}%) — AL iptal")
+        elif score >= 55:
+            score -= 4  # DİKKATLİ AL'ı zayıflat
+
+    # ── TREND FİLTRESİ — coin kendi trendinde değilse AL verme ──
+    # 4h EMA20 < EMA50 = aşağı trend. Bu trendde AL = bıçak tuzağı.
+    if own_trend == "bearish":
+        if score >= 68:
+            score = min(score, 62)
+            reasons.append("⚠️ Trend aşağı (4h EMA) — AL iptal")
+        elif score >= 55:
+            score -= 3
+
     score = max(10, min(95, score))
 
     if   score >= 90: signal = "ÇOK GÜÇLÜ AL"
@@ -340,6 +438,8 @@ def compute_smart_score(symbol, use_orderbook=True):
         "volume_ratio": round(vol_ratio, 2),
         "price_change": round(price_change, 2),
         "price":        price,
+        "own_trend":    own_trend,
+        "market_state": market["state"],
     }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -465,31 +565,112 @@ def market_sentiment():
 # ══════════════════════════════════════════════════════════════════════════════
 @app.get("/api/backtest/{symbol}")
 def backtest(symbol: str, days: int = 30):
+    """
+    Gerçekçi backtest: Şu anki skorlama sistemiyle geçmişi simüle eder.
+    Filtreler: RSI + MACD + BB + hacim + EMA trend + bıçak yakalama.
+    """
     try:
         days = max(7, min(90, days))
         sym  = symbol.upper() + "USDT"
-        limit = days * 24 + 24
-        klines = get_pub("/api/v3/klines", {"symbol": sym, "interval": "1h", "limit": min(limit, 1000)})
-        if len(klines) < 48:
+        limit_1h = min(days * 24 + 100, 1000)
+        klines_1h = get_pub("/api/v3/klines", {"symbol": sym, "interval": "1h", "limit": limit_1h})
+        if len(klines_1h) < 100:
             return {"success": False, "error": "yeterli veri yok", "symbol": symbol.upper()}
 
-        closes = [float(k[4]) for k in klines]
-        times  = [int(k[0])   for k in klines]
+        # 4h verisi de al — trend filtreleri için
+        limit_4h = min(days * 6 + 60, 500)
+        klines_4h = get_pub("/api/v3/klines", {"symbol": sym, "interval": "4h", "limit": limit_4h})
+
+        closes_1h = [float(k[4]) for k in klines_1h]
+        vols_1h   = [float(k[7]) for k in klines_1h]
+        times_1h  = [int(k[0])   for k in klines_1h]
+
+        closes_4h = [float(k[4]) for k in klines_4h]
+        times_4h  = [int(k[0])   for k in klines_4h]
 
         signals_list = []
-        capital = 1000.0
+        capital      = 1000.0
+        filtered_out = 0  # filtreler kaç sinyali iptal etti
 
-        for i in range(14, len(closes) - 24):
-            window = closes[max(0, i-14):i+1]
-            r = calc_rsi(window, 14)
+        # Her 4 saatlik bir kez kontrol et (spam'i önle)
+        for i in range(50, len(closes_1h) - 24, 4):
+            # 1h göstergeler
+            window = closes_1h[max(0, i-50):i+1]
+            r      = calc_rsi(window, 14)
+            macd_l, macd_s = calc_macd(window)
+            macd_sig = 1 if macd_l > macd_s else -1
+            bb_up, bb_mid, bb_lo = calc_bollinger(window, 20, 2)
+            price = closes_1h[i]
+            bb_pos = -1 if price <= bb_lo * 1.02 else 1 if price >= bb_up * 0.98 else 0
 
+            # Hacim oranı (son 24h vs önceki 24h)
+            if i >= 48:
+                cur_v  = sum(vols_1h[i-24:i])
+                prev_v = sum(vols_1h[i-48:i-24])
+                vol_ratio = cur_v / prev_v if prev_v > 0 else 1.0
+            else:
+                vol_ratio = 1.0
+
+            # 24h fiyat değişimi
+            price_24h_ago = closes_1h[i-24] if i >= 24 else closes_1h[0]
+            price_change = (price - price_24h_ago) / price_24h_ago * 100
+
+            # 4h EMA trend (o zamanki duruma göre)
+            t_now = times_1h[i]
+            closes_4h_upto = [c for c, t in zip(closes_4h, times_4h) if t <= t_now]
+            if len(closes_4h_upto) >= 50:
+                ema20 = calc_ema(closes_4h_upto, 20)
+                ema50 = calc_ema(closes_4h_upto, 50)
+                own_trend = "bullish" if ema20 > ema50 else "bearish"
+            else:
+                own_trend = "unknown"
+
+            # ── SKORLAMA (frontend'deki ile aynı mantık) ────────────
+            score = 50
+            if   r < 25: score += 15
+            elif r < 35: score += 10
+            elif r < 45: score += 5
+            elif r > 75: score -= 12
+            elif r > 65: score -= 6
+
+            if macd_sig == 1: score += 6
+            else:             score -= 4
+
+            if bb_pos == -1: score += 8
+            elif bb_pos == 1: score -= 10
+
+            if   vol_ratio > 2.5: score += 10
+            elif vol_ratio > 1.8: score += 6
+            elif vol_ratio > 1.3: score += 3
+            elif vol_ratio > 1.0: pass
+            elif vol_ratio > 0.8: score -= 3
+            elif vol_ratio > 0.6: score -= 7
+            else:                 score -= 12
+
+            if   price_change > 15: score += 3
+            elif price_change > 8:  score += 2
+            elif price_change < -15: score -= 8
+            elif price_change < -8:  score -= 4
+
+            # Bıçak yakalama
+            if price_change < -3 and vol_ratio < 1.0:
+                score -= 8
+
+            # TREND FİLTRESİ
+            if own_trend == "bearish" and score >= 68:
+                score = min(score, 62)
+
+            score = max(10, min(95, score))
+
+            # AL sinyali mi?
             sig = None
-            if   r < 35: sig = "AL"
-            elif r > 65: sig = "SAT"
-            if not sig: continue
+            if score >= 68: sig = "AL"
+            elif score < 35: sig = "SAT"
+            if not sig:
+                continue
 
-            entry = closes[i]
-            exit_ = closes[i + 24]
+            entry  = closes_1h[i]
+            exit_  = closes_1h[i + 24]
             change = (exit_ - entry) / entry * 100
             if sig == "SAT": change = -change
 
@@ -500,18 +681,26 @@ def backtest(symbol: str, days: int = 30):
                 capital *= (1 - abs(change) / 100 * 0.5)
 
             signals_list.append({
-                "timestamp": times[i],
+                "timestamp": times_1h[i],
                 "signal":    sig,
                 "entry":     round(entry, 6),
                 "exit":      round(exit_, 6),
                 "change":    round(change, 2),
+                "score":     score,
                 "rsi":       round(r, 1),
+                "own_trend": own_trend,
                 "success":   success,
             })
 
         wins   = sum(1 for s in signals_list if s["success"])
         losses = len(signals_list) - wins
         win_rate = round(wins / len(signals_list) * 100, 1) if signals_list else 0
+
+        # Bant bazlı analiz
+        strong = [s for s in signals_list if s["score"] >= 80]
+        normal = [s for s in signals_list if 68 <= s["score"] < 80]
+        strong_wr = round(sum(1 for s in strong if s["success"]) / len(strong) * 100, 1) if strong else 0
+        normal_wr = round(sum(1 for s in normal if s["success"]) / len(normal) * 100, 1) if normal else 0
 
         return {
             "success":         True,
@@ -521,9 +710,14 @@ def backtest(symbol: str, days: int = 30):
             "wins":            wins,
             "losses":          losses,
             "win_rate":        win_rate,
+            "strong_signals":  len(strong),
+            "strong_win_rate": strong_wr,
+            "normal_signals":  len(normal),
+            "normal_win_rate": normal_wr,
             "final_capital":   round(capital, 2),
             "profit_pct":      round((capital - 1000) / 10, 2),
             "last_signals":    signals_list[-20:],
+            "note":            "Yeni skorlama: RSI+MACD+BB+hacim+EMA trend+bıçak tuzağı filtresi",
         }
     except HTTPException: raise
     except Exception as e:
