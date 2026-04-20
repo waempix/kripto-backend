@@ -57,6 +57,29 @@ def get_ext(url, timeout=10, headers=None):
 @app.get("/api/ping")
 def ping(): return {"status": "ok"}
 
+# ── Binance fiyat proxy ─────────────────────────────────────────────────────
+# Frontend doğrudan Binance'e erişemediğinde (coğrafi blok, rate limit, CORS)
+# backend üzerinden proxy — Render US sunucuları engellenmez.
+_tickers_cache = {"ts": 0, "data": None}
+
+@app.get("/api/tickers")
+def tickers():
+    try:
+        now = time.time()
+        # 15 saniye cache — rate limit koruması + hızlı cevap
+        if _tickers_cache["data"] and (now - _tickers_cache["ts"]) < 15:
+            return _tickers_cache["data"]
+        data = get_pub("/api/v3/ticker/24hr")
+        result = {"success": True, "data": data, "count": len(data) if isinstance(data, list) else 0}
+        _tickers_cache["data"] = result
+        _tickers_cache["ts"]   = now
+        return result
+    except Exception as e:
+        if _tickers_cache["data"]:
+            # Backend de başarısızsa eski cache'i dön — tamamen kör olma
+            return _tickers_cache["data"]
+        return {"success": False, "error": str(e), "data": []}
+
 @app.get("/api/portfolio")
 def portfolio():
     try:
