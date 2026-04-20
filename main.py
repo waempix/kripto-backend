@@ -287,7 +287,7 @@ def market_state_endpoint():
     return get_market_state()
 
 
-
+def compute_smart_score(symbol, use_orderbook=True):
     sym = symbol.upper() + "USDT"
     ticker = get_pub("/api/v3/ticker/24hr", {"symbol": sym})
     klines = get_pub("/api/v3/klines", {"symbol": sym, "interval": "1h", "limit": 100})
