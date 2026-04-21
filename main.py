@@ -205,6 +205,7 @@ def opportunities(limit: int = 30, min_volume: float = 500000):
                 elif price_change > 8 and vol_24h > 1_000_000:
                     score += 12
                     reasons.append(f"↑ Yükseliş %{price_change:.1f}")
+                    categories.append("momentum")
 
                 # ── KRİTER 2: OVERSOLD BOUNCE (dip + hacim canlı) ─────────────
                 # 24s içinde düştü ama hacim var → dip alım fırsatı
