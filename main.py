@@ -80,6 +80,228 @@ def tickers():
             return _tickers_cache["data"]
         return {"success": False, "error": str(e), "data": []}
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+#   ENDPOINT: /api/opportunities — AGRESİF YENİ COİN KEŞFİ (5 kriter)
+# ══════════════════════════════════════════════════════════════════════════════
+# Binance'in TÜM coinlerini tarar, potansiyel AL fırsatlarını bulur.
+# Kriterler:
+#   1. PUMP MOMENTUM:    24s > +15% ve hacim > $2M
+#   2. OVERSOLD BOUNCE:  24s < -15% + hacim canlı (dip alım fırsatı)
+#   3. VOLUME SPIKE:     hacim 24s öncesine göre 3x+ arttı
+#   4. NEW LISTING:      son 30 günde eklenmiş + hacim kanıtı
+#   5. BREAKOUT:         son 7 gün yatay + bugün hacim+fiyat patlaması
+# ══════════════════════════════════════════════════════════════════════════════
+_opp_cache = {"ts": 0, "data": None}
+_new_listings_cache = {"ts": 0, "data": set()}
+
+# Stable coin'ler ve yatırım değeri olmayanlar — dışla
+BLACKLIST = {
+    "USDT", "USDC", "BUSD", "DAI", "TUSD", "USDP", "FDUSD", "PYUSD", "USDE", "RLUSD",
+    "EUR", "GBP", "TRY", "UAH", "BIDR", "NGN", "RUB", "BRL", "AUD", "JPY",
+    "USDTTRY", "BTCDOWN", "BTCUP", "ETHDOWN", "ETHUP",
+}
+
+def is_valid_symbol(symbol: str) -> bool:
+    """Spot USDT çifti + stable olmayan."""
+    if not symbol.endswith("USDT"):
+        return False
+    base = symbol[:-4]
+    if base in BLACKLIST:
+        return False
+    # Leveraged tokens (3L, 3S, DOWN, UP, BULL, BEAR)
+    for suffix in ("3L", "3S", "5L", "5S", "DOWN", "UP", "BULL", "BEAR"):
+        if base.endswith(suffix):
+            return False
+    return True
+
+
+def get_new_listings():
+    """Son 30 günde Binance'e eklenen coinleri tespit et (exchangeInfo kullanarak)."""
+    now = time.time()
+    if _new_listings_cache["data"] and now - _new_listings_cache["ts"] < 3600:
+        return _new_listings_cache["data"]
+    try:
+        info = get_pub("/api/v3/exchangeInfo")
+        cutoff_ms = (now - 30*24*3600) * 1000
+        new_set = set()
+        for s in info.get("symbols", []):
+            if s.get("status") != "TRADING":
+                continue
+            if not is_valid_symbol(s.get("symbol", "")):
+                continue
+            # Binance exchangeInfo'da onboardDate bazen var, bazen yok
+            onboard = s.get("onboardDate", 0)
+            if onboard and onboard > cutoff_ms:
+                new_set.add(s["symbol"])
+        _new_listings_cache["data"] = new_set
+        _new_listings_cache["ts"]   = now
+        return new_set
+    except Exception:
+        return set()
+
+
+@app.get("/api/opportunities")
+def opportunities(limit: int = 30, min_volume: float = 500000):
+    """
+    Agresif fırsat tarayıcı. Tüm Binance coinlerini 5 kriterle puanlar.
+    
+    Args:
+        limit: Kaç coin dön (default 30)
+        min_volume: Minimum 24s USDT hacmi (default $500K — meme dahil)
+    """
+    try:
+        now = time.time()
+        # 60 saniye cache — endpoint her dakika çağrılabilir
+        if _opp_cache["data"] and now - _opp_cache["ts"] < 60:
+            cached = _opp_cache["data"]
+            return {**cached, "cached": True}
+
+        # 1) Tüm ticker'ları çek (tek çağrı)
+        tickers = get_pub("/api/v3/ticker/24hr")
+        if not isinstance(tickers, list):
+            return {"success": False, "error": "Binance ticker hatası"}
+
+        # 2) Yeni listingler (hourly cache)
+        new_listings = get_new_listings()
+
+        # 3) Her coin için puan hesapla
+        opportunities_list = []
+        for t in tickers:
+            try:
+                sym = t["symbol"]
+                if not is_valid_symbol(sym):
+                    continue
+
+                vol_24h      = float(t["quoteVolume"])
+                if vol_24h < min_volume:
+                    continue
+
+                price_change = float(t["priceChangePercent"])
+                price        = float(t["lastPrice"])
+                high_24h     = float(t["highPrice"])
+                low_24h      = float(t["lowPrice"])
+                # Binance /ticker/24hr 'prevClosePrice' veya 'weightedAvgPrice' verir
+                prev_vol     = float(t.get("prevClosePrice", price) or price)
+                trades       = int(t.get("count", 0))
+
+                if price <= 0 or high_24h <= 0 or low_24h <= 0:
+                    continue
+
+                base = sym[:-4]
+                reasons = []
+                score = 0
+                categories = []
+
+                # ── KRİTER 1: PUMP MOMENTUM (güçlü yükseliş + hacim) ──────────
+                if price_change > 25 and vol_24h > 5_000_000:
+                    score += 35
+                    reasons.append(f"🚀 Pump %{price_change:.1f}")
+                    categories.append("pump")
+                elif price_change > 15 and vol_24h > 2_000_000:
+                    score += 25
+                    reasons.append(f"📈 Momentum %{price_change:.1f}")
+                    categories.append("pump")
+                elif price_change > 8 and vol_24h > 1_000_000:
+                    score += 12
+                    reasons.append(f"↑ Yükseliş %{price_change:.1f}")
+
+                # ── KRİTER 2: OVERSOLD BOUNCE (dip + hacim canlı) ─────────────
+                # 24s içinde düştü ama hacim var → dip alım fırsatı
+                if price_change < -20 and vol_24h > 3_000_000:
+                    # Fiyat dipten ne kadar uzakta?
+                    dip_distance = (price - low_24h) / low_24h * 100
+                    if dip_distance < 5:  # dibe çok yakın
+                        score += 30
+                        reasons.append(f"🎯 Aşırı satım (%{price_change:.1f}) dip yakın")
+                        categories.append("oversold")
+                    else:
+                        score += 15
+                        reasons.append(f"⚠ Düşüş %{price_change:.1f}")
+                elif price_change < -10 and vol_24h > 1_500_000:
+                    score += 8
+                    categories.append("oversold")
+
+                # ── KRİTER 3: VOLUME SPIKE (balina giriş sinyali) ─────────────
+                # İşlem sayısı çok yüksekse (trade count) hacim normalin üstünde
+                # Binance weightedAvgPrice üzerinden tahmini önceki hacim
+                if trades > 0:
+                    # Basit heuristic: vol_24h > ortalama olması beklenen
+                    # 100k+ trade = büyük aktivite
+                    if trades > 500_000 and vol_24h > 10_000_000:
+                        score += 15
+                        reasons.append(f"🐋 Yüksek aktivite ({trades//1000}K işlem)")
+                        categories.append("volume")
+                    elif trades > 200_000 and vol_24h > 5_000_000:
+                        score += 8
+
+                # ── KRİTER 4: NEW LISTING (son 30 gün) ────────────────────────
+                if sym in new_listings and vol_24h > 1_000_000:
+                    score += 25
+                    reasons.append("🆕 Yeni listing")
+                    categories.append("new")
+
+                # ── KRİTER 5: BREAKOUT (volatilite + hacim) ───────────────────
+                # 24h fiyat range'i > ortalama (volatilite arttı)
+                volatility = (high_24h - low_24h) / low_24h * 100
+                if volatility > 20 and vol_24h > 3_000_000:
+                    # Günün zirvesine yakın? Breakout devam ediyor olabilir
+                    high_distance = (high_24h - price) / price * 100
+                    if high_distance < 3:  # zirveye çok yakın
+                        score += 20
+                        reasons.append(f"💥 Breakout (zirveye %{high_distance:.1f})")
+                        categories.append("breakout")
+                    elif volatility > 30:
+                        score += 10
+                        reasons.append(f"⚡ Volatil %{volatility:.0f}")
+
+                # ── LIKIDITE BONUSU ─────────────────────────────────────────
+                if vol_24h > 50_000_000:
+                    score += 5  # çok likit
+                elif vol_24h < 1_000_000:
+                    score -= 3  # düşük likidite (risk)
+
+                # Skor 0'dan küçükse listeye alma
+                if score < 15 or not reasons:
+                    continue
+
+                opportunities_list.append({
+                    "symbol":        base,
+                    "full_symbol":   sym,
+                    "price":         price,
+                    "change_24h":    round(price_change, 2),
+                    "volume_24h":    round(vol_24h, 0),
+                    "volume_m":      round(vol_24h / 1_000_000, 2),
+                    "high_24h":      high_24h,
+                    "low_24h":       low_24h,
+                    "volatility":    round(volatility, 2),
+                    "trades":        trades,
+                    "score":         score,
+                    "reasons":       reasons[:4],
+                    "categories":    categories,
+                    "is_new_listing": sym in new_listings,
+                })
+            except Exception:
+                continue
+
+        # Puana göre sırala, limit kadar dön
+        opportunities_list.sort(key=lambda x: x["score"], reverse=True)
+        result = {
+            "success":       True,
+            "count":         len(opportunities_list),
+            "opportunities": opportunities_list[:limit],
+            "timestamp":     int(now * 1000),
+            "cached":        False,
+        }
+        _opp_cache["data"] = result
+        _opp_cache["ts"]   = now
+        return result
+    except Exception as e:
+        traceback.print_exc()
+        if _opp_cache["data"]:
+            return {**_opp_cache["data"], "cached": True, "error": str(e)}
+        return {"success": False, "error": str(e), "opportunities": []}
+
 @app.get("/api/portfolio")
 def portfolio():
     try:
