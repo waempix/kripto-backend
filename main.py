@@ -915,24 +915,79 @@ def backtest(symbol: str, days: int = 30):
             if not sig:
                 continue
 
-            entry  = closes_1h[i]
-            exit_  = closes_1h[i + 24]
-            change = (exit_ - entry) / entry * 100
+            entry = closes_1h[i]
+            
+            # ── AKILLI EXIT — SL/TP/Trailing (AL için) ──────────────────────
+            # Skora göre dinamik parametreler
+            if score >= 80:
+                sl_pct, tp1_pct, tp2_pct, max_hours = -4, 8, 15, 96
+            elif score >= 70:
+                sl_pct, tp1_pct, tp2_pct, max_hours = -3.5, 6, 12, 72
+            else:
+                sl_pct, tp1_pct, tp2_pct, max_hours = -3, 5, 10, 48
+            
+            # Saat saat ilerle, ilk gerçekleşen olaya göre çık
+            exit_price   = entry
+            exit_hour    = max_hours
+            exit_reason  = "TIME"
+            peak_pct     = 0
+            
+            max_check = min(i + max_hours + 1, len(closes_1h))
+            for j in range(i + 1, max_check):
+                h = j - i  # kaç saat geçti
+                price_j = closes_1h[j]
+                pct_j   = (price_j - entry) / entry * 100
+                
+                # Zirveyi takip et (trailing için)
+                if pct_j > peak_pct:
+                    peak_pct = pct_j
+                
+                if sig == "AL":
+                    # 1) SL
+                    if pct_j <= sl_pct:
+                        exit_price, exit_hour, exit_reason = entry * (1 + sl_pct/100), h, "SL"
+                        break
+                    # 2) TP2
+                    if pct_j >= tp2_pct:
+                        exit_price, exit_hour, exit_reason = entry * (1 + tp2_pct/100), h, "TP2"
+                        break
+                    # 3) Trailing: zirveden -3%, en az TP1'e değmiş
+                    if peak_pct >= tp1_pct and (peak_pct - pct_j) >= 3:
+                        exit_price, exit_hour, exit_reason = price_j, h, "TRAIL"
+                        break
+                else:  # SAT — ters mantık (short simülasyonu)
+                    if pct_j >= -sl_pct:  # SAT için SL yukarıda
+                        exit_price, exit_hour, exit_reason = entry * (1 + abs(sl_pct)/100), h, "SL"
+                        break
+                    if pct_j <= -tp2_pct:
+                        exit_price, exit_hour, exit_reason = entry * (1 - tp2_pct/100), h, "TP2"
+                        break
+            else:
+                # Döngü break olmadan bittiyse — son fiyattan kapat
+                if max_check > i + 1:
+                    exit_price = closes_1h[max_check - 1]
+                    exit_hour  = max_check - 1 - i
+            
+            change = (exit_price - entry) / entry * 100
             if sig == "SAT": change = -change
-
             success = change > 0
+
+            # Sermaye güncelleme — gerçekçi (tam pozisyon)
             if success:
                 capital *= (1 + abs(change) / 100 * 0.5)
             else:
                 capital *= (1 - abs(change) / 100 * 0.5)
 
             signals_list.append({
-                "timestamp": times_1h[i],
-                "signal":    sig,
-                "entry":     round(entry, 6),
-                "exit":      round(exit_, 6),
-                "change":    round(change, 2),
-                "score":     score,
+                "timestamp":   times_1h[i],
+                "signal":      sig,
+                "entry":       round(entry, 6),
+                "exit":        round(exit_price, 6),
+                "change":      round(change, 2),
+                "score":       score,
+                "exit_reason": exit_reason,
+                "hold_hours":  exit_hour,
+                "peak_pct":    round(peak_pct, 2),
                 "rsi":       round(r, 1),
                 "own_trend": own_trend,
                 "success":   success,
@@ -947,6 +1002,21 @@ def backtest(symbol: str, days: int = 30):
         normal = [s for s in signals_list if 68 <= s["score"] < 80]
         strong_wr = round(sum(1 for s in strong if s["success"]) / len(strong) * 100, 1) if strong else 0
         normal_wr = round(sum(1 for s in normal if s["success"]) / len(normal) * 100, 1) if normal else 0
+        
+        # Exit sebebi dağılımı
+        exit_dist = {}
+        for s in signals_list:
+            r = s.get("exit_reason", "?")
+            exit_dist[r] = exit_dist.get(r, 0) + 1
+        
+        # Ortalama kazanç/kayıp
+        win_changes  = [s["change"] for s in signals_list if s["success"]]
+        loss_changes = [s["change"] for s in signals_list if not s["success"]]
+        avg_win  = round(sum(win_changes)  / len(win_changes),  2) if win_changes  else 0
+        avg_loss = round(sum(loss_changes) / len(loss_changes), 2) if loss_changes else 0
+        
+        # Risk/reward oranı
+        rr_ratio = round(abs(avg_win / avg_loss), 2) if avg_loss != 0 else 0
 
         return {
             "success":         True,
@@ -963,7 +1033,11 @@ def backtest(symbol: str, days: int = 30):
             "final_capital":   round(capital, 2),
             "profit_pct":      round((capital - 1000) / 10, 2),
             "last_signals":    signals_list[-20:],
-            "note":            "Yeni skorlama: RSI+MACD+BB+hacim+EMA trend+bıçak tuzağı filtresi",
+            "exit_distribution": exit_dist,
+            "avg_win":         avg_win,
+            "avg_loss":        avg_loss,
+            "risk_reward":     rr_ratio,
+            "note":            "Akıllı exit: SL/TP1/TP2/Trailing + skor bazlı dinamik parametre",
         }
     except HTTPException: raise
     except Exception as e:
