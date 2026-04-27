@@ -645,29 +645,29 @@ def compute_smart_score(symbol, use_orderbook=True):
     # Eski veri: 19 AL sinyali, %26 isabet — sebep: piyasa bearish iken AL verildi.
     market = get_market_state()
     if market["state"] == "bearish":
-        if score >= 68:
-            score = min(score, 64)  # AL → DİKKATLİ AL
+        if score >= 65:
+            score = min(score, 60)  # AL → DİKKATLİ AL
             reasons.append(f"⚠️ Piyasa bearish (BTC {market['btc_24h']:+.1f}%) — AL iptal")
-        elif score >= 55:
+        elif score >= 50:
             score -= 4  # DİKKATLİ AL'ı zayıflat
 
     # ── TREND FİLTRESİ — coin kendi trendinde değilse AL verme ──
     # 4h EMA20 < EMA50 = aşağı trend. Bu trendde AL = bıçak tuzağı.
     if own_trend == "bearish":
-        if score >= 68:
-            score = min(score, 62)
+        if score >= 65:
+            score = min(score, 58)
             reasons.append("⚠️ Trend aşağı (4h EMA) — AL iptal")
-        elif score >= 55:
+        elif score >= 50:
             score -= 3
 
     score = max(10, min(95, score))
 
-    if   score >= 90: signal = "ÇOK GÜÇLÜ AL"
-    elif score >= 80: signal = "GÜÇLÜ AL"
-    elif score >= 68: signal = "AL"
-    elif score >= 55: signal = "DİKKATLİ AL"
-    elif score >= 45: signal = "BEKLE"
-    elif score >= 35: signal = "SATIŞ"
+    if   score >= 85: signal = "ÇOK GÜÇLÜ AL"
+    elif score >= 75: signal = "GÜÇLÜ AL"
+    elif score >= 65: signal = "AL"
+    elif score >= 50: signal = "DİKKATLİ AL"
+    elif score >= 40: signal = "BEKLE"
+    elif score >= 30: signal = "SATIŞ"
     else:             signal = "SAT"
 
     return {
@@ -903,15 +903,15 @@ def backtest(symbol: str, days: int = 30):
                 score -= 8
 
             # TREND FİLTRESİ
-            if own_trend == "bearish" and score >= 68:
-                score = min(score, 62)
+            if own_trend == "bearish" and score >= 65:
+                score = min(score, 58)
 
             score = max(10, min(95, score))
 
             # AL sinyali mi?
             sig = None
-            if score >= 68: sig = "AL"
-            elif score < 35: sig = "SAT"
+            if score >= 65: sig = "AL"
+            elif score < 30: sig = "SAT"
             if not sig:
                 continue
 
@@ -919,9 +919,9 @@ def backtest(symbol: str, days: int = 30):
             
             # ── AKILLI EXIT — SL/TP/Trailing (AL için) ──────────────────────
             # Skora göre dinamik parametreler
-            if score >= 80:
+            if score >= 75:
                 sl_pct, tp1_pct, tp2_pct, max_hours = -4, 8, 15, 96
-            elif score >= 70:
+            elif score >= 65:
                 sl_pct, tp1_pct, tp2_pct, max_hours = -3.5, 6, 12, 72
             else:
                 sl_pct, tp1_pct, tp2_pct, max_hours = -3, 5, 10, 48
@@ -997,21 +997,35 @@ def backtest(symbol: str, days: int = 30):
         losses = len(signals_list) - wins
         win_rate = round(wins / len(signals_list) * 100, 1) if signals_list else 0
 
-        # Bant bazlı analiz
-        strong = [s for s in signals_list if s["score"] >= 80]
-        normal = [s for s in signals_list if 68 <= s["score"] < 80]
+        # ── SADECE AL SİNYALLERİ — sen spot trade ediyorsun, short yapmıyorsun ──
+        al_signals = [s for s in signals_list if s["signal"] == "AL"]
+        sat_signals = [s for s in signals_list if s["signal"] == "SAT"]
+        al_wins = sum(1 for s in al_signals if s["success"])
+        al_wr = round(al_wins / len(al_signals) * 100, 1) if al_signals else 0
+        al_avg_change = round(sum(s["change"] for s in al_signals) / len(al_signals), 2) if al_signals else 0
+        # AL-only sermaye simülasyonu
+        al_capital = 1000.0
+        for s in al_signals:
+            if s["success"]:
+                al_capital *= (1 + abs(s["change"]) / 100 * 0.5)
+            else:
+                al_capital *= (1 - abs(s["change"]) / 100 * 0.5)
+
+        # Bant bazlı analiz (sadece AL'lar)
+        strong = [s for s in al_signals if s["score"] >= 75]
+        normal = [s for s in al_signals if 65 <= s["score"] < 75]
         strong_wr = round(sum(1 for s in strong if s["success"]) / len(strong) * 100, 1) if strong else 0
         normal_wr = round(sum(1 for s in normal if s["success"]) / len(normal) * 100, 1) if normal else 0
         
-        # Exit sebebi dağılımı
+        # Exit sebebi dağılımı (sadece AL)
         exit_dist = {}
-        for s in signals_list:
+        for s in al_signals:
             r = s.get("exit_reason", "?")
             exit_dist[r] = exit_dist.get(r, 0) + 1
         
-        # Ortalama kazanç/kayıp
-        win_changes  = [s["change"] for s in signals_list if s["success"]]
-        loss_changes = [s["change"] for s in signals_list if not s["success"]]
+        # Ortalama kazanç/kayıp (sadece AL)
+        win_changes  = [s["change"] for s in al_signals if s["success"]]
+        loss_changes = [s["change"] for s in al_signals if not s["success"]]
         avg_win  = round(sum(win_changes)  / len(win_changes),  2) if win_changes  else 0
         avg_loss = round(sum(loss_changes) / len(loss_changes), 2) if loss_changes else 0
         
@@ -1022,22 +1036,39 @@ def backtest(symbol: str, days: int = 30):
             "success":         True,
             "symbol":          symbol.upper(),
             "days":            days,
-            "total_signals":   len(signals_list),
-            "wins":            wins,
-            "losses":          losses,
-            "win_rate":        win_rate,
+            
+            # ── AL SİNYALLERİ (BİRİNCİL — sen spot trade ediyorsun) ──
+            "total_signals":   len(al_signals),       # AL sayısı
+            "wins":            al_wins,               # AL kazananları
+            "losses":          len(al_signals) - al_wins,
+            "win_rate":        al_wr,                 # AL isabet oranı
+            "final_capital":   round(al_capital, 2),  # AL-only sermaye
+            "profit_pct":      round((al_capital - 1000) / 10, 2),
+            "avg_change":      al_avg_change,         # AL ortalama getiri
+            
+            # Bant analizi (AL içinde)
             "strong_signals":  len(strong),
             "strong_win_rate": strong_wr,
             "normal_signals":  len(normal),
             "normal_win_rate": normal_wr,
-            "final_capital":   round(capital, 2),
-            "profit_pct":      round((capital - 1000) / 10, 2),
-            "last_signals":    signals_list[-20:],
+            
+            # AL-only detaylar
+            "al_avg_win":      avg_win,
+            "al_avg_loss":     avg_loss,
+            "al_risk_reward":  rr_ratio,
             "exit_distribution": exit_dist,
-            "avg_win":         avg_win,
-            "avg_loss":        avg_loss,
-            "risk_reward":     rr_ratio,
-            "note":            "Akıllı exit: SL/TP1/TP2/Trailing + skor bazlı dinamik parametre",
+            
+            # SAT istatistiği — bilgi amaçlı
+            "sat_signals":     len(sat_signals),
+            "sat_wins":        sum(1 for s in sat_signals if s["success"]),
+            "sat_win_rate":    round(sum(1 for s in sat_signals if s["success"]) / len(sat_signals) * 100, 1) if sat_signals else 0,
+            
+            # Toplam (eski uyumluluk)
+            "all_signals":     len(signals_list),
+            "all_win_rate":    win_rate,
+            
+            "last_signals":    signals_list[-20:],
+            "note":            "İSTATİSTİK: SADECE AL sinyalleri (sen spot ediyorsun, short yok). SAT'lar bilgi.",
         }
     except HTTPException: raise
     except Exception as e:
