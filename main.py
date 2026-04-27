@@ -1606,3 +1606,580 @@ def batch_sentiment(req: BatchSentimentReq):
         return {"success": True, "cached": False, "sentiments": result, "analyzed": len(to_analyze)}
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#   INTELLIGENCE ENGINE — 5 kaynak birleşik analiz
+# ══════════════════════════════════════════════════════════════════════════════
+# Kaynaklar (hepsi ÜCRETSİZ + sınırsız):
+#   1. RSS News      — CoinDesk + CoinTelegraph + Decrypt RSS (sentiment çıkar)
+#   2. Reddit        — r/CryptoCurrency + r/CryptoMoonShots trend
+#   3. DefiLlama     — TVL değişimi (DeFi coinler için)
+#   4. Binance Ann.  — yeni listing duyuruları
+#   5. Whale Alert   — büyük cüzdan hareketleri (RSS)
+#
+# Birleşik intelligence_score 0-100 — şu an istatistiğe dahil değil, gözlemde.
+# Yeterli veri biriktiğinde teknik skora eklenecek.
+#
+# CryptoPanic kaldırıldı (1 Nisan 2026 itibarıyla ücretsiz API kapandı, $50/hafta+)
+# Onun yerine 3 RSS feed'i (CoinDesk + CoinTelegraph + Decrypt) kullanılıyor — 
+# CryptoPanic'in haber kaynaklarının çoğunu zaten bunlar oluşturuyordu.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Cache'ler — her kaynağın kendi yenileme periyodu var
+_crypto_news_cache  = {"ts": 0, "data": {}}    # 5 dk - CoinDesk/CoinTelegraph/Decrypt RSS
+_reddit_cache       = {"ts": 0, "data": {}}    # 10 dk
+_defillama_cache    = {"ts": 0, "data": {}}    # 30 dk (TVL yavaş değişir)
+_binance_ann_cache  = {"ts": 0, "data": []}    # 15 dk
+_whale_alert_cache  = {"ts": 0, "data": []}    # 5 dk
+
+# Coin sembol algılama — haber başlık/içeriğinden
+COIN_PATTERNS = {
+    "BTC": ["BITCOIN", "BTC"],
+    "ETH": ["ETHEREUM", "ETH", "ETHER"],
+    "SOL": ["SOLANA", "SOL"],
+    "BNB": ["BINANCE COIN", "BNB"],
+    "XRP": ["XRP", "RIPPLE"],
+    "ADA": ["CARDANO", "ADA"],
+    "DOGE": ["DOGECOIN", "DOGE"],
+    "AVAX": ["AVALANCHE", "AVAX"],
+    "DOT": ["POLKADOT", "DOT"],
+    "LINK": ["CHAINLINK", "LINK"],
+    "UNI": ["UNISWAP", "UNI"],
+    "NEAR": ["NEAR PROTOCOL", "NEAR"],
+    "APT": ["APTOS", "APT"],
+    "SUI": ["SUI"],
+    "ARB": ["ARBITRUM", "ARB"],
+    "OP": ["OPTIMISM"],
+    "INJ": ["INJECTIVE", "INJ"],
+    "TAO": ["BITTENSOR", "TAO"],
+    "PEPE": ["PEPE"],
+    "SHIB": ["SHIBA INU", "SHIB"],
+    "BONK": ["BONK"],
+    "AAVE": ["AAVE"],
+    "FET": ["FETCH.AI", "FET"],
+    "RENDER": ["RENDER", "RNDR"],
+    "WLD": ["WORLDCOIN", "WLD"],
+    "JUP": ["JUPITER", "JUP"],
+    "PENDLE": ["PENDLE"],
+    "HYPE": ["HYPERLIQUID", "HYPE"],
+    "ATOM": ["COSMOS", "ATOM"],
+    "LTC": ["LITECOIN", "LTC"],
+    "MATIC": ["POLYGON", "MATIC"],
+    "POL": ["POL"],
+    "TRX": ["TRON", "TRX"],
+    "XMR": ["MONERO", "XMR"],
+    "HBAR": ["HEDERA", "HBAR"],
+}
+
+# Pozitif/negatif kelime listeleri (RSS sentiment için)
+POSITIVE_WORDS = {"surge","surges","rally","rallies","bullish","gains","soar","soars",
+                  "moon","breakthrough","adoption","pump","green","rise","rising",
+                  "higher","ath","record","approve","approval","launch","integrate",
+                  "partnership","upgrade","milestone","success","boost","boosts","jump",
+                  "skyrocket","explode","outperform","accumulate","institutional"}
+NEGATIVE_WORDS = {"crash","crashes","plunge","plunges","bearish","drop","drops","fall",
+                  "falls","ban","bans","hack","hacks","scam","dump","red","decline",
+                  "lower","selloff","liquidat","panic","fear","reject","delay",
+                  "lawsuit","sec","fraud","collapse","tumble","slump","bleed",
+                  "exploit","drain","theft","stolen"}
+
+
+def fetch_crypto_news_rss():
+    """
+    CoinDesk + CoinTelegraph + Decrypt RSS feed'lerinden son 100 haberi çek.
+    Coin sembolü + sentiment çıkar.
+    CryptoPanic ücretli oldu, bu 3 kaynak birlikte aynı işi görüyor (ücretsiz).
+    """
+    now = time.time()
+    if _crypto_news_cache["data"] and now - _crypto_news_cache["ts"] < 300:
+        return _crypto_news_cache["data"]
+    
+    import re
+    feeds = [
+        ("CoinDesk",      "https://www.coindesk.com/arc/outboundfeeds/rss/"),
+        ("CoinTelegraph", "https://cointelegraph.com/rss"),
+        ("Decrypt",       "https://decrypt.co/feed"),
+    ]
+    
+    coin_data = {}
+    for source_name, url in feeds:
+        try:
+            with urllib.request.urlopen(url, timeout=10) as r:
+                xml_text = r.read().decode("utf-8", errors="ignore")
+        except Exception as e:
+            print(f"{source_name} RSS hatası: {e}")
+            continue
+        
+        # <item> blokları çıkar
+        items = re.findall(r'<item[^>]*>(.+?)</item>', xml_text, re.DOTALL)
+        for item in items[:30]:  # ilk 30 haber per kaynak
+            # Title - CDATA veya plain
+            title_m = (re.search(r'<title><!\[CDATA\[(.+?)\]\]></title>', item) or 
+                       re.search(r'<title[^>]*>(.+?)</title>', item))
+            desc_m  = (re.search(r'<description><!\[CDATA\[(.+?)\]\]></description>', item) or 
+                       re.search(r'<description[^>]*>(.+?)</description>', item))
+            date_m  = re.search(r'<pubDate>(.+?)</pubDate>', item)
+            
+            if not title_m:
+                continue
+            
+            title = re.sub(r'<[^>]+>', '', title_m.group(1)).strip()  # HTML tag temizle
+            desc  = re.sub(r'<[^>]+>', '', desc_m.group(1)).strip() if desc_m else ""
+            
+            # Tarih kontrolü — son 24 saat
+            pub_ts = 0
+            if date_m:
+                try:
+                    from email.utils import parsedate_to_datetime
+                    pub_ts = parsedate_to_datetime(date_m.group(1)).timestamp()
+                except Exception:
+                    pass
+            if pub_ts and (now - pub_ts) > 86400:  # 24 saat üstü atla
+                continue
+            
+            full_text = (title + " " + desc).upper()
+            full_lower = full_text.lower()
+            
+            # Coin tespit
+            mentioned = []
+            for sym, patterns in COIN_PATTERNS.items():
+                for pat in patterns:
+                    # Word boundary kontrolü
+                    if re.search(r'\b' + re.escape(pat) + r'\b', full_text):
+                        mentioned.append(sym)
+                        break
+            
+            if not mentioned:
+                continue
+            
+            # Sentiment
+            pos = sum(1 for w in POSITIVE_WORDS if w in full_lower)
+            neg = sum(1 for w in NEGATIVE_WORDS if w in full_lower)
+            
+            for sym in mentioned:
+                if sym not in coin_data:
+                    coin_data[sym] = {
+                        "news_count": 0, "positive": 0, "negative": 0, 
+                        "titles": [], "sources": set()
+                    }
+                coin_data[sym]["news_count"] += 1
+                coin_data[sym]["positive"]   += pos
+                coin_data[sym]["negative"]   += neg
+                coin_data[sym]["sources"].add(source_name)
+                if len(coin_data[sym]["titles"]) < 3:
+                    coin_data[sym]["titles"].append({
+                        "title": title[:100],
+                        "source": source_name,
+                        "sentiment": "pozitif" if pos > neg else "negatif" if neg > pos else "nötr"
+                    })
+    
+    # set'i listeye çevir (JSON için)
+    for sym in coin_data:
+        coin_data[sym]["sources"] = sorted(coin_data[sym]["sources"])
+    
+    _crypto_news_cache["data"] = coin_data
+    _crypto_news_cache["ts"]   = now
+    return coin_data
+
+
+def fetch_reddit_trends():
+    """r/CryptoCurrency + r/CryptoMoonShots'tan trending coinleri sayar."""
+    now = time.time()
+    if _reddit_cache["data"] and now - _reddit_cache["ts"] < 600:
+        return _reddit_cache["data"]
+    try:
+        coin_mentions = {}
+        # Reddit JSON API — User-Agent zorunlu
+        headers = {"User-Agent": "KriptoAI/1.0 (by /u/anon)"}
+        for sub in ["CryptoCurrency", "CryptoMoonShots"]:
+            try:
+                url = f"https://www.reddit.com/r/{sub}/hot.json?limit=50"
+                data = get_ext(url, timeout=10, headers=headers)
+                posts = data.get("data", {}).get("children", [])
+                for p in posts:
+                    pd = p.get("data", {})
+                    title = (pd.get("title", "") + " " + pd.get("selftext", ""))[:500].upper()
+                    score = pd.get("score", 0) or 0
+                    comments = pd.get("num_comments", 0) or 0
+                    # Yaygın coin sembolleri tara
+                    for coin in ["BTC","ETH","SOL","BNB","XRP","ADA","DOGE","AVAX","DOT","LINK",
+                                 "UNI","NEAR","APT","SUI","ARB","OP","INJ","HYPE","TAO","PEPE",
+                                 "SHIB","BONK","RENDER","FET","WLD","JUP","PENDLE","AAVE","ATOM",
+                                 "LTC","FTM","MATIC","AKT","TRX","XMR","HBAR","POL","STRK"]:
+                        # "BTC", "$BTC", "#BTC" eşleşmeleri
+                        if (f" {coin} " in f" {title} " or f"${coin}" in title 
+                            or f"#{coin}" in title or title.startswith(coin + " ")):
+                            if coin not in coin_mentions:
+                                coin_mentions[coin] = {"mentions": 0, "score": 0, "comments": 0}
+                            coin_mentions[coin]["mentions"] += 1
+                            coin_mentions[coin]["score"]    += score
+                            coin_mentions[coin]["comments"] += comments
+            except Exception as e:
+                print(f"Reddit /r/{sub} hatası: {e}")
+                continue
+        _reddit_cache["data"] = coin_mentions
+        _reddit_cache["ts"]   = now
+        return coin_mentions
+    except Exception as e:
+        print(f"Reddit hatası: {e}")
+        return _reddit_cache["data"] or {}
+
+
+def fetch_defillama_tvl():
+    """DefiLlama'dan ana protokollerin TVL değişimini çek."""
+    now = time.time()
+    if _defillama_cache["data"] and now - _defillama_cache["ts"] < 1800:
+        return _defillama_cache["data"]
+    try:
+        # Top 100 protokol — sembol bazlı eşleştirme
+        url = "https://api.llama.fi/protocols"
+        data = get_ext(url, timeout=15)
+        if not isinstance(data, list):
+            return {}
+        # Her token için ilgili protokolleri bul, TVL değişim ortalama
+        # Symbol mapping — protokoldeki gov token sembolü
+        token_data = {}
+        for proto in data[:300]:  # ilk 300 protokol
+            symbol = (proto.get("symbol") or "").upper().strip("-")
+            if not symbol or symbol == "-":
+                continue
+            tvl_now    = proto.get("tvl") or 0
+            change_1d  = proto.get("change_1d") or 0
+            change_7d  = proto.get("change_7d") or 0
+            if tvl_now < 1_000_000:  # $1M altı protokol önemsiz
+                continue
+            if symbol not in token_data:
+                token_data[symbol] = {
+                    "tvl": 0, "tvl_change_1d": 0, "tvl_change_7d": 0,
+                    "protocol_count": 0, "name": proto.get("name", "")
+                }
+            token_data[symbol]["tvl"]              += tvl_now
+            token_data[symbol]["tvl_change_1d"]    += change_1d * tvl_now  # ağırlıklı
+            token_data[symbol]["tvl_change_7d"]    += change_7d * tvl_now
+            token_data[symbol]["protocol_count"]   += 1
+        # Ağırlıklı ortalamayı hesapla
+        for sym, d in token_data.items():
+            if d["tvl"] > 0:
+                d["tvl_change_1d"] = round(d["tvl_change_1d"] / d["tvl"], 2)
+                d["tvl_change_7d"] = round(d["tvl_change_7d"] / d["tvl"], 2)
+                d["tvl"] = round(d["tvl"] / 1_000_000, 1)  # $M olarak
+        _defillama_cache["data"] = token_data
+        _defillama_cache["ts"]   = now
+        return token_data
+    except Exception as e:
+        print(f"DefiLlama hatası: {e}")
+        return _defillama_cache["data"] or {}
+
+
+def fetch_binance_announcements():
+    """Binance announcement RSS'inden son 30 günde duyurulan listingleri çek."""
+    now = time.time()
+    if _binance_ann_cache["data"] and now - _binance_ann_cache["ts"] < 900:
+        return _binance_ann_cache["data"]
+    try:
+        # Binance announcements RSS yok ama API var
+        # https://www.binance.com/bapi/composite/v1/public/cms/article/list/query
+        # Alternatif: zoomic.io veya benzer agregatör — burası fallback
+        url = ("https://www.binance.com/bapi/composite/v1/public/cms/article/list/query"
+               "?type=1&pageNo=1&pageSize=30&catalogId=48")
+        data = get_ext(url, timeout=10)
+        articles = data.get("data", {}).get("articles", [])
+        listings = []
+        cutoff = (now - 30*24*3600) * 1000
+        for a in articles[:30]:
+            title = a.get("title", "") or ""
+            release = a.get("releaseDate", 0) or 0
+            if release < cutoff:
+                continue
+            # "Binance Will List XXX" pattern'i ara
+            up = title.upper()
+            if "WILL LIST" in up or "LISTING" in up or "LISTS" in up:
+                # Coin sembolünü çıkar
+                import re
+                # Parantez içi sembol: "Binance Will List Foo (BAR)"
+                m = re.search(r'\(([A-Z0-9]{2,10})\)', title)
+                if m:
+                    listings.append({
+                        "symbol": m.group(1),
+                        "title": title[:120],
+                        "released": release,
+                    })
+        _binance_ann_cache["data"] = listings
+        _binance_ann_cache["ts"]   = now
+        return listings
+    except Exception as e:
+        print(f"Binance announcements hatası: {e}")
+        return _binance_ann_cache["data"] or []
+
+
+def fetch_whale_alerts():
+    """Whale Alert RSS — son 24 saat büyük cüzdan hareketleri."""
+    now = time.time()
+    if _whale_alert_cache["data"] and now - _whale_alert_cache["ts"] < 300:
+        return _whale_alert_cache["data"]
+    try:
+        # Whale Alert RSS — ücretsiz, paywall yok
+        url = "https://whale-alert.io/feed/all"
+        # Bu RSS — XML parse gerekiyor
+        try:
+            with urllib.request.urlopen(url, timeout=10) as r:
+                xml_text = r.read().decode("utf-8", errors="ignore")
+        except Exception:
+            return _whale_alert_cache["data"] or []
+        # Basit XML parse — <title> içine <coin> ve $miktar
+        import re
+        items = re.findall(r'<item>(.+?)</item>', xml_text, re.DOTALL)
+        alerts = []
+        cutoff = now - 24*3600
+        for item in items[:50]:
+            title_m = re.search(r'<title><!\[CDATA\[(.+?)\]\]></title>', item)
+            date_m  = re.search(r'<pubDate>(.+?)</pubDate>', item)
+            if not title_m:
+                continue
+            title = title_m.group(1)
+            ts = 0
+            if date_m:
+                try:
+                    from email.utils import parsedate_to_datetime
+                    ts = parsedate_to_datetime(date_m.group(1)).timestamp()
+                except Exception:
+                    pass
+            if ts and ts < cutoff:
+                continue
+            # "1,234 BTC ($45,678,912 USD) transferred from..." pattern
+            coin_m = re.search(r'#([A-Z]{2,10})', title)
+            usd_m  = re.search(r'\$(\d[\d,]*)', title)
+            if coin_m and usd_m:
+                try:
+                    usd = int(usd_m.group(1).replace(",", ""))
+                    if usd >= 1_000_000:  # $1M+ harekat
+                        alerts.append({
+                            "symbol": coin_m.group(1),
+                            "usd": usd,
+                            "title": title[:150],
+                            "ts": ts,
+                        })
+                except Exception:
+                    continue
+        _whale_alert_cache["data"] = alerts
+        _whale_alert_cache["ts"]   = now
+        return alerts
+    except Exception as e:
+        print(f"Whale Alert hatası: {e}")
+        return _whale_alert_cache["data"] or []
+
+
+@app.get("/api/intelligence/{symbol}")
+def intelligence(symbol: str):
+    """
+    Tek coin için 5 kaynaklı zenginleştirilmiş analiz.
+    Skor 0-100 arası — şu an gözlem amaçlı, sinyale dahil değil.
+    """
+    sym = symbol.upper()
+    try:
+        # 5 kaynaktan veri çek (cache sayesinde hızlı)
+        news_data  = fetch_crypto_news_rss()  # CoinDesk + CoinTelegraph + Decrypt
+        rd_data    = fetch_reddit_trends()
+        tvl_data   = fetch_defillama_tvl()
+        ann_data   = fetch_binance_announcements()
+        whale_data = fetch_whale_alerts()
+
+        signals = []
+        score   = 50  # nötr başla
+
+        # ── 1. RSS haber sentiment (CoinDesk + CoinTelegraph + Decrypt) ──
+        nd = news_data.get(sym, {})
+        news_count = nd.get("news_count", 0)
+        n_pos = nd.get("positive", 0)
+        n_neg = nd.get("negative", 0)
+        sources = nd.get("sources", [])
+        if news_count > 0:
+            net = n_pos - n_neg
+            # Çoklu kaynak çarpanı — 3 kaynak da yazıyorsa daha güvenilir
+            multi_source = len(sources) >= 2
+            if net >= 5:
+                bonus = 14 if multi_source else 10
+                score += bonus
+                signals.append(f"📰 Çok pozitif haber ({news_count}x, {len(sources)} kaynak)")
+            elif net >= 2:
+                score += 6
+                signals.append(f"📰 Olumlu haberler ({news_count})")
+            elif net <= -5:
+                score -= 14 if multi_source else 10
+                signals.append(f"📰 Çok negatif haber ({news_count}x)")
+            elif net <= -2:
+                score -= 6
+                signals.append(f"📰 Olumsuz haberler ({news_count})")
+            elif news_count >= 5:
+                score += 3
+                signals.append(f"📰 Haber yoğun ({news_count})")
+
+        # ── 2. Reddit trend ────────────────────────────────────
+        rd = rd_data.get(sym, {})
+        rd_mentions = rd.get("mentions", 0)
+        rd_score    = rd.get("score", 0)
+        if rd_mentions >= 5:
+            score += 10
+            signals.append(f"🔥 Reddit trending ({rd_mentions} post, {rd_score} upvote)")
+        elif rd_mentions >= 3:
+            score += 5
+            signals.append(f"💬 Reddit'te konuşuluyor ({rd_mentions} post)")
+        elif rd_mentions >= 1 and rd_score > 100:
+            score += 3
+            signals.append(f"💬 Reddit'te ilgi (+{rd_score} upvote)")
+
+        # ── 3. DefiLlama TVL ───────────────────────────────────
+        tvl = tvl_data.get(sym, {})
+        if tvl.get("tvl", 0) > 0:
+            tvl_7d = tvl.get("tvl_change_7d", 0)
+            if tvl_7d > 30:
+                score += 15
+                signals.append(f"🟢 TVL +{tvl_7d}% (7g) — büyük büyüme")
+            elif tvl_7d > 10:
+                score += 8
+                signals.append(f"🟢 TVL +{tvl_7d}% (7g)")
+            elif tvl_7d < -20:
+                score -= 12
+                signals.append(f"🔴 TVL {tvl_7d}% (7g) — düşüş")
+            elif tvl_7d < -10:
+                score -= 6
+                signals.append(f"🔴 TVL {tvl_7d}% (7g)")
+
+        # ── 4. Binance yeni listing ────────────────────────────
+        for ann in ann_data:
+            if ann["symbol"] == sym:
+                # 7 gün içinde duyuru → büyük etki
+                age_hours = (time.time() - ann["released"]/1000) / 3600
+                if age_hours < 168:  # 7 gün
+                    score += 25
+                    signals.append(f"🆕 Binance listing! ({int(age_hours)}h önce)")
+                    break
+
+        # ── 5. Whale Alert ─────────────────────────────────────
+        sym_alerts = [a for a in whale_data if a["symbol"] == sym]
+        if sym_alerts:
+            total_usd = sum(a["usd"] for a in sym_alerts)
+            count = len(sym_alerts)
+            if total_usd > 100_000_000:
+                score += 12
+                signals.append(f"🐋 ${total_usd//1_000_000}M whale hareket ({count} işlem)")
+            elif total_usd > 20_000_000:
+                score += 7
+                signals.append(f"🐋 ${total_usd//1_000_000}M whale hareket")
+            elif count >= 3:
+                score += 4
+                signals.append(f"🐋 {count} whale işlem")
+
+        score = max(10, min(95, score))
+
+        return {
+            "success": True,
+            "symbol":  sym,
+            "intelligence_score": int(round(score)),
+            "signals": signals[:6],
+            "details": {
+                "news": {
+                    "news_count":     news_count,
+                    "positive_words": n_pos,
+                    "negative_words": n_neg,
+                    "sources":        sources,
+                    "titles":         nd.get("titles", []),
+                },
+                "reddit": {
+                    "mentions": rd_mentions,
+                    "upvotes":  rd_score,
+                    "comments": rd.get("comments", 0),
+                },
+                "defillama": {
+                    "tvl_m":         tvl.get("tvl", 0),
+                    "tvl_change_1d": tvl.get("tvl_change_1d", 0),
+                    "tvl_change_7d": tvl.get("tvl_change_7d", 0),
+                    "protocols":     tvl.get("protocol_count", 0),
+                },
+                "binance_listing": next((a for a in ann_data if a["symbol"] == sym), None),
+                "whale_alerts": [
+                    {"usd_m": a["usd"]//1_000_000, "title": a["title"][:80]} 
+                    for a in sym_alerts[:5]
+                ],
+            }
+        }
+    except Exception as e:
+        traceback.print_exc()
+        return {"success": False, "symbol": sym, "error": str(e)}
+
+
+@app.get("/api/intelligence-batch")
+def intelligence_batch(symbols: str):
+    """
+    Birden çok coin için intelligence skor — daha verimli.
+    Frontend dinamik tarama'da bunu çağırır.
+    """
+    try:
+        sym_list = [s.strip().upper() for s in symbols.split(",") if s.strip()][:50]
+        # Veriler ortak — bir kez çek
+        news_data  = fetch_crypto_news_rss()
+        rd_data    = fetch_reddit_trends()
+        tvl_data   = fetch_defillama_tvl()
+        ann_data   = fetch_binance_announcements()
+        whale_data = fetch_whale_alerts()
+        
+        result = {}
+        for sym in sym_list:
+            score = 50
+            signals = []
+            
+            # RSS news (CoinDesk + CoinTelegraph + Decrypt)
+            nd = news_data.get(sym, {})
+            news_count = nd.get("news_count", 0)
+            net = (nd.get("positive", 0) - nd.get("negative", 0))
+            multi_source = len(nd.get("sources", [])) >= 2
+            if net >= 5:
+                score += 14 if multi_source else 10
+                signals.append(f"📰 Çok pozitif ({news_count})")
+            elif net >= 2:
+                score += 6
+            elif net <= -5:
+                score -= 14 if multi_source else 10
+                signals.append(f"📰 Negatif ({news_count})")
+            elif net <= -2:
+                score -= 6
+            
+            # Reddit
+            rd = rd_data.get(sym, {})
+            m = rd.get("mentions", 0)
+            if m >= 5:   score += 10; signals.append(f"🔥 Reddit trend ({m})")
+            elif m >= 3: score += 5
+            
+            # DefiLlama
+            tvl = tvl_data.get(sym, {})
+            tvl_7d = tvl.get("tvl_change_7d", 0) if tvl else 0
+            if tvl_7d > 30:    score += 15; signals.append(f"🟢 TVL +{tvl_7d}%")
+            elif tvl_7d > 10:  score += 8
+            elif tvl_7d < -20: score -= 12; signals.append(f"🔴 TVL {tvl_7d}%")
+            elif tvl_7d < -10: score -= 6
+            
+            # Binance listing
+            for a in ann_data:
+                if a["symbol"] == sym and (time.time() - a["released"]/1000) < 168*3600:
+                    score += 25
+                    signals.append("🆕 Yeni listing")
+                    break
+            
+            # Whale
+            alerts = [w for w in whale_data if w["symbol"] == sym]
+            if alerts:
+                total = sum(a["usd"] for a in alerts)
+                if total > 100_000_000:   score += 12; signals.append(f"🐋 ${total//1_000_000}M whale")
+                elif total > 20_000_000:  score += 7
+                elif len(alerts) >= 3:    score += 4
+            
+            score = max(10, min(95, score))
+            result[sym] = {
+                "intelligence_score": int(round(score)),
+                "signals": signals[:3],
+            }
+        
+        return {"success": True, "intelligence": result, "count": len(result)}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
