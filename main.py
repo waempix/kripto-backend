@@ -58,15 +58,12 @@ def get_ext(url, timeout=10, headers=None):
 def ping(): return {"status": "ok"}
 
 # ── Binance fiyat proxy ─────────────────────────────────────────────────────
-# Frontend doğrudan Binance'e erişemediğinde (coğrafi blok, rate limit, CORS)
-# backend üzerinden proxy — Render US sunucuları engellenmez.
 _tickers_cache = {"ts": 0, "data": None}
 
 @app.get("/api/tickers")
 def tickers():
     try:
         now = time.time()
-        # 15 saniye cache — rate limit koruması + hızlı cevap
         if _tickers_cache["data"] and (now - _tickers_cache["ts"]) < 15:
             return _tickers_cache["data"]
         data = get_pub("/api/v3/ticker/24hr")
@@ -76,7 +73,6 @@ def tickers():
         return result
     except Exception as e:
         if _tickers_cache["data"]:
-            # Backend de başarısızsa eski cache'i dön — tamamen kör olma
             return _tickers_cache["data"]
         return {"success": False, "error": str(e), "data": []}
 
@@ -84,18 +80,9 @@ def tickers():
 # ══════════════════════════════════════════════════════════════════════════════
 #   ENDPOINT: /api/opportunities — AGRESİF YENİ COİN KEŞFİ (5 kriter)
 # ══════════════════════════════════════════════════════════════════════════════
-# Binance'in TÜM coinlerini tarar, potansiyel AL fırsatlarını bulur.
-# Kriterler:
-#   1. PUMP MOMENTUM:    24s > +15% ve hacim > $2M
-#   2. OVERSOLD BOUNCE:  24s < -15% + hacim canlı (dip alım fırsatı)
-#   3. VOLUME SPIKE:     hacim 24s öncesine göre 3x+ arttı
-#   4. NEW LISTING:      son 30 günde eklenmiş + hacim kanıtı
-#   5. BREAKOUT:         son 7 gün yatay + bugün hacim+fiyat patlaması
-# ══════════════════════════════════════════════════════════════════════════════
 _opp_cache = {"ts": 0, "data": None}
 _new_listings_cache = {"ts": 0, "data": set()}
 
-# Stable coin'ler ve yatırım değeri olmayanlar — dışla
 BLACKLIST = {
     "USDT", "USDC", "BUSD", "DAI", "TUSD", "USDP", "FDUSD", "PYUSD", "USDE", "RLUSD",
     "EUR", "GBP", "TRY", "UAH", "BIDR", "NGN", "RUB", "BRL", "AUD", "JPY",
@@ -103,13 +90,11 @@ BLACKLIST = {
 }
 
 def is_valid_symbol(symbol: str) -> bool:
-    """Spot USDT çifti + stable olmayan."""
     if not symbol.endswith("USDT"):
         return False
     base = symbol[:-4]
     if base in BLACKLIST:
         return False
-    # Leveraged tokens (3L, 3S, DOWN, UP, BULL, BEAR)
     for suffix in ("3L", "3S", "5L", "5S", "DOWN", "UP", "BULL", "BEAR"):
         if base.endswith(suffix):
             return False
@@ -117,7 +102,6 @@ def is_valid_symbol(symbol: str) -> bool:
 
 
 def get_new_listings():
-    """Son 30 günde Binance'e eklenen coinleri tespit et (exchangeInfo kullanarak)."""
     now = time.time()
     if _new_listings_cache["data"] and now - _new_listings_cache["ts"] < 3600:
         return _new_listings_cache["data"]
@@ -130,7 +114,6 @@ def get_new_listings():
                 continue
             if not is_valid_symbol(s.get("symbol", "")):
                 continue
-            # Binance exchangeInfo'da onboardDate bazen var, bazen yok
             onboard = s.get("onboardDate", 0)
             if onboard and onboard > cutoff_ms:
                 new_set.add(s["symbol"])
@@ -143,29 +126,18 @@ def get_new_listings():
 
 @app.get("/api/opportunities")
 def opportunities(limit: int = 30, min_volume: float = 500000):
-    """
-    Agresif fırsat tarayıcı. Tüm Binance coinlerini 5 kriterle puanlar.
-    
-    Args:
-        limit: Kaç coin dön (default 30)
-        min_volume: Minimum 24s USDT hacmi (default $500K — meme dahil)
-    """
     try:
         now = time.time()
-        # 60 saniye cache — endpoint her dakika çağrılabilir
         if _opp_cache["data"] and now - _opp_cache["ts"] < 60:
             cached = _opp_cache["data"]
             return {**cached, "cached": True}
 
-        # 1) Tüm ticker'ları çek (tek çağrı)
         tickers = get_pub("/api/v3/ticker/24hr")
         if not isinstance(tickers, list):
             return {"success": False, "error": "Binance ticker hatası"}
 
-        # 2) Yeni listingler (hourly cache)
         new_listings = get_new_listings()
 
-        # 3) Her coin için puan hesapla
         opportunities_list = []
         for t in tickers:
             try:
@@ -173,7 +145,7 @@ def opportunities(limit: int = 30, min_volume: float = 500000):
                 if not is_valid_symbol(sym):
                     continue
 
-                vol_24h      = float(t["quoteVolume"])
+                vol_24h = float(t["quoteVolume"])
                 if vol_24h < min_volume:
                     continue
 
@@ -181,8 +153,6 @@ def opportunities(limit: int = 30, min_volume: float = 500000):
                 price        = float(t["lastPrice"])
                 high_24h     = float(t["highPrice"])
                 low_24h      = float(t["lowPrice"])
-                # Binance /ticker/24hr 'prevClosePrice' veya 'weightedAvgPrice' verir
-                prev_vol     = float(t.get("prevClosePrice", price) or price)
                 trades       = int(t.get("count", 0))
 
                 if price <= 0 or high_24h <= 0 or low_24h <= 0:
@@ -193,7 +163,6 @@ def opportunities(limit: int = 30, min_volume: float = 500000):
                 score = 0
                 categories = []
 
-                # ── KRİTER 1: PUMP MOMENTUM (güçlü yükseliş + hacim) ──────────
                 if price_change > 25 and vol_24h > 5_000_000:
                     score += 35
                     reasons.append(f"🚀 Pump %{price_change:.1f}")
@@ -207,12 +176,9 @@ def opportunities(limit: int = 30, min_volume: float = 500000):
                     reasons.append(f"↑ Yükseliş %{price_change:.1f}")
                     categories.append("momentum")
 
-                # ── KRİTER 2: OVERSOLD BOUNCE (dip + hacim canlı) ─────────────
-                # 24s içinde düştü ama hacim var → dip alım fırsatı
                 if price_change < -20 and vol_24h > 3_000_000:
-                    # Fiyat dipten ne kadar uzakta?
                     dip_distance = (price - low_24h) / low_24h * 100
-                    if dip_distance < 5:  # dibe çok yakın
+                    if dip_distance < 5:
                         score += 30
                         reasons.append(f"🎯 Aşırı satım (%{price_change:.1f}) dip yakın")
                         categories.append("oversold")
@@ -223,12 +189,7 @@ def opportunities(limit: int = 30, min_volume: float = 500000):
                     score += 8
                     categories.append("oversold")
 
-                # ── KRİTER 3: VOLUME SPIKE (balina giriş sinyali) ─────────────
-                # İşlem sayısı çok yüksekse (trade count) hacim normalin üstünde
-                # Binance weightedAvgPrice üzerinden tahmini önceki hacim
                 if trades > 0:
-                    # Basit heuristic: vol_24h > ortalama olması beklenen
-                    # 100k+ trade = büyük aktivite
                     if trades > 500_000 and vol_24h > 10_000_000:
                         score += 15
                         reasons.append(f"🐋 Yüksek aktivite ({trades//1000}K işlem)")
@@ -236,19 +197,15 @@ def opportunities(limit: int = 30, min_volume: float = 500000):
                     elif trades > 200_000 and vol_24h > 5_000_000:
                         score += 8
 
-                # ── KRİTER 4: NEW LISTING (son 30 gün) ────────────────────────
                 if sym in new_listings and vol_24h > 1_000_000:
                     score += 25
                     reasons.append("🆕 Yeni listing")
                     categories.append("new")
 
-                # ── KRİTER 5: BREAKOUT (volatilite + hacim) ───────────────────
-                # 24h fiyat range'i > ortalama (volatilite arttı)
                 volatility = (high_24h - low_24h) / low_24h * 100
                 if volatility > 20 and vol_24h > 3_000_000:
-                    # Günün zirvesine yakın? Breakout devam ediyor olabilir
                     high_distance = (high_24h - price) / price * 100
-                    if high_distance < 3:  # zirveye çok yakın
+                    if high_distance < 3:
                         score += 20
                         reasons.append(f"💥 Breakout (zirveye %{high_distance:.1f})")
                         categories.append("breakout")
@@ -256,13 +213,11 @@ def opportunities(limit: int = 30, min_volume: float = 500000):
                         score += 10
                         reasons.append(f"⚡ Volatil %{volatility:.0f}")
 
-                # ── LIKIDITE BONUSU ─────────────────────────────────────────
                 if vol_24h > 50_000_000:
-                    score += 5  # çok likit
+                    score += 5
                 elif vol_24h < 1_000_000:
-                    score -= 3  # düşük likidite (risk)
+                    score -= 3
 
-                # Skor 0'dan küçükse listeye alma
                 if score < 15 or not reasons:
                     continue
 
@@ -285,7 +240,6 @@ def opportunities(limit: int = 30, min_volume: float = 500000):
             except Exception:
                 continue
 
-        # Puana göre sırala, limit kadar dön
         opportunities_list.sort(key=lambda x: x["score"], reverse=True)
         result = {
             "success":       True,
@@ -466,45 +420,35 @@ def calc_bollinger(prices, period=20, std_dev=2):
     std = variance ** 0.5
     return middle + std*std_dev, middle, middle - std*std_dev
 
-# ══════════════════════════════════════════════════════════════════════════════
-#              ORTAK SMART-SCORE HESAPLAYICI
-# ══════════════════════════════════════════════════════════════════════════════
 def calc_ema(values, period):
-    """Exponential Moving Average — son değere daha çok ağırlık verir."""
     if len(values) < period:
         return sum(values) / len(values) if values else 0.0
     k = 2 / (period + 1)
-    ema = sum(values[:period]) / period  # SMA başlangıç
+    ema = sum(values[:period]) / period
     for v in values[period:]:
         ema = v * k + ema * (1 - k)
     return ema
 
 
 # ── PİYASA DURUMU CACHE ──────────────────────────────────────────────────────
-# BTC'nin 24 saat değişimi ve 4 saatlik trend durumu. Tüm sinyaller için
-# ortak filtre — 5 dakika cache ile aşırı API çağrısını önle.
 _market_state_cache = {"ts": 0, "state": None}
 
 def get_market_state():
-    """BTC'nin genel durumu — bearish/neutral/bullish."""
     now = time.time()
     if _market_state_cache["state"] and now - _market_state_cache["ts"] < 300:
         return _market_state_cache["state"]
     try:
-        # BTC 24h değişim
         ticker = get_pub("/api/v3/ticker/24hr", {"symbol": "BTCUSDT"})
         btc_24h = float(ticker["priceChangePercent"])
 
-        # BTC 4h trend: EMA20 vs EMA50 (son 100 4-saatlik mum)
         klines_4h = get_pub("/api/v3/klines", {"symbol": "BTCUSDT", "interval": "4h", "limit": 100})
         closes_4h = [float(k[4]) for k in klines_4h]
         ema20_4h  = calc_ema(closes_4h, 20)
         ema50_4h  = calc_ema(closes_4h, 50)
         btc_trend = "bullish" if ema20_4h > ema50_4h else "bearish"
 
-        # Durum belirle
         if btc_24h < -3.0:
-            state = "bearish"   # sert düşüş — risky, AL'lar filtrelenmeli
+            state = "bearish"
         elif btc_24h < -1.5 and btc_trend == "bearish":
             state = "bearish"
         elif btc_24h > 2.0 and btc_trend == "bullish":
@@ -523,13 +467,11 @@ def get_market_state():
         _market_state_cache["ts"]    = now
         return result
     except Exception as e:
-        # Hata durumunda nötr — filtre kapatma
         return {"state": "neutral", "btc_24h": 0, "btc_trend": "unknown", "error": str(e)}
 
 
 @app.get("/api/market-state")
 def market_state_endpoint():
-    """Piyasa durumunu dışa aç — frontend de okusun istersen."""
     return get_market_state()
 
 
@@ -560,7 +502,6 @@ def compute_smart_score(symbol, use_orderbook=True):
         except Exception:
             pass
 
-    # Hacim oranı — aynı birim (USDT) k[7]
     try:
         if len(klines) >= 48:
             cur_v  = sum(float(k[7]) for k in klines[-24:])
@@ -574,9 +515,6 @@ def compute_smart_score(symbol, use_orderbook=True):
         vol_ratio = 1.0
     vol_ratio = max(0.1, min(20.0, vol_ratio))
 
-    # ── TREND DOĞRULAMA — coin'in kendi 4h EMA'sı ────────────────────────
-    # Coin'in teknik göstergeleri iyi olabilir ama trend hâlâ aşağıysa dip yapmamış.
-    # Yükseliş trendi için EMA20(4h) > EMA50(4h) şartı aranır.
     own_trend = "unknown"
     try:
         klines_4h  = get_pub("/api/v3/klines", {"symbol": sym, "interval": "4h", "limit": 60})
@@ -611,14 +549,11 @@ def compute_smart_score(symbol, use_orderbook=True):
     elif buy_pressure < 0.6:  score -= 12; reasons.append(f"Güçlü satış {buy_pressure:.1f}x")
     elif buy_pressure < 0.85: score -= 5
 
-    # ── Hacim skorlama — zayıf hacimli yükselişler TUZAK olabilir ──
-    # Büyük hacim artışı = güçlü hareket (birikim veya panik satış)
-    # Düşük hacim = "kimse ilgilenmiyor" — dip yapsa bile alım gelmeyebilir
     if   vol_ratio > 2.5: score += 10; reasons.append(f"Hacim {vol_ratio:.1f}x arttı")
     elif vol_ratio > 1.8: score += 6;  reasons.append(f"Hacim {vol_ratio:.1f}x arttı")
     elif vol_ratio > 1.3: score += 3
-    elif vol_ratio > 1.0: pass                                         # normal
-    elif vol_ratio > 0.8: score -= 3                                    # hafif zayıf
+    elif vol_ratio > 1.0: pass
+    elif vol_ratio > 0.8: score -= 3
     elif vol_ratio > 0.6: score -= 7;  reasons.append(f"Hacim {vol_ratio:.1f}x zayıf")
     else:                 score -= 12; reasons.append(f"Hacim {vol_ratio:.1f}x çok zayıf")
 
@@ -628,31 +563,22 @@ def compute_smart_score(symbol, use_orderbook=True):
     elif price_change < -15: score -= 8; reasons.append(f"%{price_change:.1f} düşüş")
     elif price_change < -8:  score -= 4
 
-    # ── BIÇAK YAKALAMA GUARDI ──
-    # Fiyat düşerken hacim de düşükse: kimse almıyor demek, dip burada DEĞİL.
-    # Klasik "bıçağı düşerken yakalama" tuzağı — bunu aktif engelliyoruz.
     if price_change < -3 and vol_ratio < 1.0:
         score -= 8
         reasons.append("⚠️ Düşüşte zayıf hacim (bıçak tuzağı)")
 
-    # ── SATIŞ TARAFINDA BASKI + DÜŞÜŞ = kaçış sinyali ──
     if buy_pressure < 0.9 and price_change < -3:
         score -= 5
         reasons.append("⚠️ Satış baskısı + düşüş")
 
-    # ── PİYASA YÖNÜ FİLTRESİ — BTC düşüşte ise AL sinyalini yumuşat ──
-    # Altcoin'ler BTC'yi takip eder. BTC düşerken altcoin "AL fırsatı" çoğu zaman tuzak.
-    # Eski veri: 19 AL sinyali, %26 isabet — sebep: piyasa bearish iken AL verildi.
     market = get_market_state()
     if market["state"] == "bearish":
         if score >= 65:
-            score = min(score, 60)  # AL → DİKKATLİ AL
+            score = min(score, 60)
             reasons.append(f"⚠️ Piyasa bearish (BTC {market['btc_24h']:+.1f}%) — AL iptal")
         elif score >= 50:
-            score -= 4  # DİKKATLİ AL'ı zayıflat
+            score -= 4
 
-    # ── TREND FİLTRESİ — coin kendi trendinde değilse AL verme ──
-    # 4h EMA20 < EMA50 = aşağı trend. Bu trendde AL = bıçak tuzağı.
     if own_trend == "bearish":
         if score >= 65:
             score = min(score, 58)
@@ -688,9 +614,6 @@ def compute_smart_score(symbol, use_orderbook=True):
         "market_state": market["state"],
     }
 
-# ══════════════════════════════════════════════════════════════════════════════
-#                ENDPOINT: /api/smart-score/{symbol}
-# ══════════════════════════════════════════════════════════════════════════════
 @app.get("/api/smart-score/{symbol}")
 def smart_score(symbol: str):
     try:
@@ -714,9 +637,6 @@ def smart_score(symbol: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ══════════════════════════════════════════════════════════════════════════════
-#        ENDPOINT: /api/signals  (toplu smart-score, 1 istek = 30 coin)
-# ══════════════════════════════════════════════════════════════════════════════
 _signals_cache = {"ts": 0, "key": "", "data": {}}
 
 @app.get("/api/signals")
@@ -734,7 +654,6 @@ def signals(symbols: str = ""):
         out = {}
         for sym in syms:
             try:
-                # use_orderbook=False: 30 coin için depth çağrısı rate limit yakar
                 out[sym] = compute_smart_score(sym, use_orderbook=False)
             except Exception as err:
                 out[sym] = {"error": str(err)}
@@ -811,10 +730,6 @@ def market_sentiment():
 # ══════════════════════════════════════════════════════════════════════════════
 @app.get("/api/backtest/{symbol}")
 def backtest(symbol: str, days: int = 30):
-    """
-    Gerçekçi backtest: Şu anki skorlama sistemiyle geçmişi simüle eder.
-    Filtreler: RSI + MACD + BB + hacim + EMA trend + bıçak yakalama.
-    """
     try:
         days = max(7, min(90, days))
         sym  = symbol.upper() + "USDT"
@@ -823,7 +738,6 @@ def backtest(symbol: str, days: int = 30):
         if len(klines_1h) < 100:
             return {"success": False, "error": "yeterli veri yok", "symbol": symbol.upper()}
 
-        # 4h verisi de al — trend filtreleri için
         limit_4h = min(days * 6 + 60, 500)
         klines_4h = get_pub("/api/v3/klines", {"symbol": sym, "interval": "4h", "limit": limit_4h})
 
@@ -836,11 +750,8 @@ def backtest(symbol: str, days: int = 30):
 
         signals_list = []
         capital      = 1000.0
-        filtered_out = 0  # filtreler kaç sinyali iptal etti
 
-        # Her 4 saatlik bir kez kontrol et (spam'i önle)
         for i in range(50, len(closes_1h) - 24, 4):
-            # 1h göstergeler
             window = closes_1h[max(0, i-50):i+1]
             r      = calc_rsi(window, 14)
             macd_l, macd_s = calc_macd(window)
@@ -849,7 +760,6 @@ def backtest(symbol: str, days: int = 30):
             price = closes_1h[i]
             bb_pos = -1 if price <= bb_lo * 1.02 else 1 if price >= bb_up * 0.98 else 0
 
-            # Hacim oranı (son 24h vs önceki 24h)
             if i >= 48:
                 cur_v  = sum(vols_1h[i-24:i])
                 prev_v = sum(vols_1h[i-48:i-24])
@@ -857,11 +767,9 @@ def backtest(symbol: str, days: int = 30):
             else:
                 vol_ratio = 1.0
 
-            # 24h fiyat değişimi
             price_24h_ago = closes_1h[i-24] if i >= 24 else closes_1h[0]
             price_change = (price - price_24h_ago) / price_24h_ago * 100
 
-            # 4h EMA trend (o zamanki duruma göre)
             t_now = times_1h[i]
             closes_4h_upto = [c for c, t in zip(closes_4h, times_4h) if t <= t_now]
             if len(closes_4h_upto) >= 50:
@@ -871,7 +779,6 @@ def backtest(symbol: str, days: int = 30):
             else:
                 own_trend = "unknown"
 
-            # ── SKORLAMA (frontend'deki ile aynı mantık) ────────────
             score = 50
             if   r < 25: score += 15
             elif r < 35: score += 10
@@ -898,17 +805,14 @@ def backtest(symbol: str, days: int = 30):
             elif price_change < -15: score -= 8
             elif price_change < -8:  score -= 4
 
-            # Bıçak yakalama
             if price_change < -3 and vol_ratio < 1.0:
                 score -= 8
 
-            # TREND FİLTRESİ
             if own_trend == "bearish" and score >= 65:
                 score = min(score, 58)
 
             score = max(10, min(95, score))
 
-            # AL sinyali mi?
             sig = None
             if score >= 65: sig = "AL"
             elif score < 30: sig = "SAT"
@@ -917,8 +821,6 @@ def backtest(symbol: str, days: int = 30):
 
             entry = closes_1h[i]
             
-            # ── AKILLI EXIT — SL/TP/Trailing (AL için) ──────────────────────
-            # Skora göre dinamik parametreler
             if score >= 75:
                 sl_pct, tp1_pct, tp2_pct, max_hours = -4, 8, 15, 96
             elif score >= 65:
@@ -926,7 +828,6 @@ def backtest(symbol: str, days: int = 30):
             else:
                 sl_pct, tp1_pct, tp2_pct, max_hours = -3, 5, 10, 48
             
-            # Saat saat ilerle, ilk gerçekleşen olaya göre çık
             exit_price   = entry
             exit_hour    = max_hours
             exit_reason  = "TIME"
@@ -934,36 +835,31 @@ def backtest(symbol: str, days: int = 30):
             
             max_check = min(i + max_hours + 1, len(closes_1h))
             for j in range(i + 1, max_check):
-                h = j - i  # kaç saat geçti
+                h = j - i
                 price_j = closes_1h[j]
                 pct_j   = (price_j - entry) / entry * 100
                 
-                # Zirveyi takip et (trailing için)
                 if pct_j > peak_pct:
                     peak_pct = pct_j
                 
                 if sig == "AL":
-                    # 1) SL
                     if pct_j <= sl_pct:
                         exit_price, exit_hour, exit_reason = entry * (1 + sl_pct/100), h, "SL"
                         break
-                    # 2) TP2
                     if pct_j >= tp2_pct:
                         exit_price, exit_hour, exit_reason = entry * (1 + tp2_pct/100), h, "TP2"
                         break
-                    # 3) Trailing: zirveden -3%, en az TP1'e değmiş
                     if peak_pct >= tp1_pct and (peak_pct - pct_j) >= 3:
                         exit_price, exit_hour, exit_reason = price_j, h, "TRAIL"
                         break
-                else:  # SAT — ters mantık (short simülasyonu)
-                    if pct_j >= -sl_pct:  # SAT için SL yukarıda
+                else:
+                    if pct_j >= -sl_pct:
                         exit_price, exit_hour, exit_reason = entry * (1 + abs(sl_pct)/100), h, "SL"
                         break
                     if pct_j <= -tp2_pct:
                         exit_price, exit_hour, exit_reason = entry * (1 - tp2_pct/100), h, "TP2"
                         break
             else:
-                # Döngü break olmadan bittiyse — son fiyattan kapat
                 if max_check > i + 1:
                     exit_price = closes_1h[max_check - 1]
                     exit_hour  = max_check - 1 - i
@@ -972,7 +868,6 @@ def backtest(symbol: str, days: int = 30):
             if sig == "SAT": change = -change
             success = change > 0
 
-            # Sermaye güncelleme — gerçekçi (tam pozisyon)
             if success:
                 capital *= (1 + abs(change) / 100 * 0.5)
             else:
@@ -997,13 +892,11 @@ def backtest(symbol: str, days: int = 30):
         losses = len(signals_list) - wins
         win_rate = round(wins / len(signals_list) * 100, 1) if signals_list else 0
 
-        # ── SADECE AL SİNYALLERİ — sen spot trade ediyorsun, short yapmıyorsun ──
         al_signals = [s for s in signals_list if s["signal"] == "AL"]
         sat_signals = [s for s in signals_list if s["signal"] == "SAT"]
         al_wins = sum(1 for s in al_signals if s["success"])
         al_wr = round(al_wins / len(al_signals) * 100, 1) if al_signals else 0
         al_avg_change = round(sum(s["change"] for s in al_signals) / len(al_signals), 2) if al_signals else 0
-        # AL-only sermaye simülasyonu
         al_capital = 1000.0
         for s in al_signals:
             if s["success"]:
@@ -1011,62 +904,47 @@ def backtest(symbol: str, days: int = 30):
             else:
                 al_capital *= (1 - abs(s["change"]) / 100 * 0.5)
 
-        # Bant bazlı analiz (sadece AL'lar)
         strong = [s for s in al_signals if s["score"] >= 75]
         normal = [s for s in al_signals if 65 <= s["score"] < 75]
         strong_wr = round(sum(1 for s in strong if s["success"]) / len(strong) * 100, 1) if strong else 0
         normal_wr = round(sum(1 for s in normal if s["success"]) / len(normal) * 100, 1) if normal else 0
         
-        # Exit sebebi dağılımı (sadece AL)
         exit_dist = {}
         for s in al_signals:
             r = s.get("exit_reason", "?")
             exit_dist[r] = exit_dist.get(r, 0) + 1
         
-        # Ortalama kazanç/kayıp (sadece AL)
         win_changes  = [s["change"] for s in al_signals if s["success"]]
         loss_changes = [s["change"] for s in al_signals if not s["success"]]
         avg_win  = round(sum(win_changes)  / len(win_changes),  2) if win_changes  else 0
         avg_loss = round(sum(loss_changes) / len(loss_changes), 2) if loss_changes else 0
         
-        # Risk/reward oranı
         rr_ratio = round(abs(avg_win / avg_loss), 2) if avg_loss != 0 else 0
 
         return {
             "success":         True,
             "symbol":          symbol.upper(),
             "days":            days,
-            
-            # ── AL SİNYALLERİ (BİRİNCİL — sen spot trade ediyorsun) ──
-            "total_signals":   len(al_signals),       # AL sayısı
-            "wins":            al_wins,               # AL kazananları
+            "total_signals":   len(al_signals),
+            "wins":            al_wins,
             "losses":          len(al_signals) - al_wins,
-            "win_rate":        al_wr,                 # AL isabet oranı
-            "final_capital":   round(al_capital, 2),  # AL-only sermaye
+            "win_rate":        al_wr,
+            "final_capital":   round(al_capital, 2),
             "profit_pct":      round((al_capital - 1000) / 10, 2),
-            "avg_change":      al_avg_change,         # AL ortalama getiri
-            
-            # Bant analizi (AL içinde)
+            "avg_change":      al_avg_change,
             "strong_signals":  len(strong),
             "strong_win_rate": strong_wr,
             "normal_signals":  len(normal),
             "normal_win_rate": normal_wr,
-            
-            # AL-only detaylar
             "al_avg_win":      avg_win,
             "al_avg_loss":     avg_loss,
             "al_risk_reward":  rr_ratio,
             "exit_distribution": exit_dist,
-            
-            # SAT istatistiği — bilgi amaçlı
             "sat_signals":     len(sat_signals),
             "sat_wins":        sum(1 for s in sat_signals if s["success"]),
             "sat_win_rate":    round(sum(1 for s in sat_signals if s["success"]) / len(sat_signals) * 100, 1) if sat_signals else 0,
-            
-            # Toplam (eski uyumluluk)
             "all_signals":     len(signals_list),
             "all_win_rate":    win_rate,
-            
             "last_signals":    signals_list[-20:],
             "note":            "İSTATİSTİK: SADECE AL sinyalleri (sen spot ediyorsun, short yok). SAT'lar bilgi.",
         }
@@ -1081,19 +959,6 @@ _whale_cache = {"ts": 0, "data": None}
 
 @app.get("/api/whale-activity")
 def whale_activity(min_usd: int = 25000):
-    """
-    Son 1 saatte Binance'de gerçekleşmiş BÜYÜK işlemleri tespit eder.
-
-    Yöntem: /api/v3/aggTrades — aynı taker order'ın aynı fiyattan aldığı tüm
-    parçaları tek satır olarak birleştirir. Gerçek "balina" emri budur.
-    Son 1 saatlik pencerede min_usd üstü işlemler "balina işlemi" sayılır.
-
-    ÖNCEKİ HATA: /api/v3/trades sadece son ~500 işlem döner (BTC için
-    ~30 saniyelik bir pencere). O kısa pencerede $100K+ tek işlem hemen
-    hemen hiç olmuyordu — sonuç: hep 0.
-
-    2 dakika cache.
-    """
     try:
         now = time.time()
         if _whale_cache["data"] and (now - _whale_cache["ts"]) < 120:
@@ -1105,7 +970,6 @@ def whale_activity(min_usd: int = 25000):
         alerts = []
         totals = {}
 
-        # Son 1 saat: startTime = now - 60dk (ms cinsinden)
         one_hour_ago_ms = int((now - 3600) * 1000)
 
         for sym in watch:
@@ -1125,9 +989,6 @@ def whale_activity(min_usd: int = 25000):
                     usd   = qty * price
                     if usd < min_usd: continue
                     count_big += 1
-                    # aggTrades'te "m" = was the buyer the maker?
-                    # True  → taker satıyor (agresif SAT)
-                    # False → taker alıyor (agresif AL)
                     is_sell = bool(t.get("m"))
                     if is_sell: big_sell += usd
                     else:       big_buy  += usd
@@ -1140,7 +1001,6 @@ def whale_activity(min_usd: int = 25000):
                         "time":   int(t["T"]),
                     })
                 net = big_buy - big_sell
-                # Küçük coinlerde eşik daha düşük olmalı (PEPE'de $250K hayal)
                 threshold = 100000 if sym in ("BTC","ETH","SOL","BNB") else 50000
                 totals[sym] = {
                     "big_buy_usd":  round(big_buy, 0),
@@ -1335,12 +1195,6 @@ def market_analysis_all():
 # ══════════════════════════════════════════════════════════════════════════════
 #                  ENDPOINT: /api/telegram  (push notification)
 # ══════════════════════════════════════════════════════════════════════════════
-# Kullanım: Render env'e TELEGRAM_BOT_TOKEN ve TELEGRAM_CHAT_ID ekleyin.
-# Bot token almak için:
-#   1. Telegram'da @BotFather'a /newbot yaz
-#   2. İsim ver, token alırsın
-#   3. Bot'a bir mesaj at, sonra https://api.telegram.org/bot<TOKEN>/getUpdates
-#      ziyaret et, chat_id buradan al
 TG_TOKEN    = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT_ID  = os.environ.get("TELEGRAM_CHAT_ID", "")
 
@@ -1371,13 +1225,11 @@ def telegram_send(msg: TelegramMsg):
 # ══════════════════════════════════════════════════════════════════════════════
 #                  ENDPOINT: /api/sentiment-analysis  (Claude + haberler)
 # ══════════════════════════════════════════════════════════════════════════════
-# Verilen coin'in güncel haberlerini toplayıp Claude ile sentiment analizi yapar.
-# Çıktı: pozitif/negatif/nötr + özet + önemli konular
-_sentiment_cache = {}  # sym → (ts, result)
+_sentiment_cache = {}
 
 class SentimentReq(BaseModel):
     symbol:    str
-    news_list: list = []  # frontend'den zaten çekilmiş haberler
+    news_list: list = []
 
 @app.post("/api/sentiment-analysis")
 def sentiment_analysis(req: SentimentReq):
@@ -1385,13 +1237,11 @@ def sentiment_analysis(req: SentimentReq):
         return {"success": False, "error": "Claude API key eksik"}
     try:
         sym = req.symbol.upper()
-        # 30 dakika cache
         if sym in _sentiment_cache:
             ts, cached = _sentiment_cache[sym]
             if time.time() - ts < 1800:
                 return cached
 
-        # Haberleri filtrele — bu coinden bahsedenler
         relevant = []
         name_map = {
             "BTC":["bitcoin","btc"],          "ETH":["ethereum","ether","eth"],
@@ -1416,7 +1266,6 @@ def sentiment_analysis(req: SentimentReq):
 
         for n in req.news_list[:40]:
             title = (n.get("title") or "").lower()
-            # Herhangi bir anahtar kelime geçerse eşleştir
             if any(k in title for k in keywords):
                 relevant.append(n.get("title"))
 
@@ -1455,7 +1304,6 @@ def sentiment_analysis(req: SentimentReq):
             data = json.loads(res.read().decode("utf-8"))
         text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text").strip()
 
-        # JSON'u parse et (bazen markdown bloğunda geliyor)
         if "```" in text:
             text = text.split("```")[1]
             if text.startswith("json"):
@@ -1480,28 +1328,23 @@ def sentiment_analysis(req: SentimentReq):
 # ══════════════════════════════════════════════════════════════════════════════
 #                  ENDPOINT: /api/batch-sentiment
 # ══════════════════════════════════════════════════════════════════════════════
-# Birden çok coin için tek Claude çağrısı ile sentiment analizi.
-# Maliyet optimizasyonu: 30 coin × tek tek = $0.06, toplu = $0.003.
 _batch_sentiment_cache = {"ts": 0, "data": {}}
 
 class BatchSentimentReq(BaseModel):
-    symbols:   list          # ["BTC","ETH","SOL",...]
-    news_list: list = []     # global haber havuzu
+    symbols:   list
+    news_list: list = []
 
 @app.post("/api/batch-sentiment")
 def batch_sentiment(req: BatchSentimentReq):
     if not CLAUDE_API_KEY:
         return {"success": False, "error": "Claude API key eksik"}
     try:
-        # 15 dakika cache — çok sık çağrılmasın
         now = time.time()
         if req.symbols and now - _batch_sentiment_cache["ts"] < 900:
             cached = _batch_sentiment_cache["data"]
-            # İstenen semboller cache'de varsa direkt dön
             if all(s.upper() in cached for s in req.symbols):
                 return {"success": True, "cached": True, "sentiments": {s.upper(): cached[s.upper()] for s in req.symbols}}
 
-        # Her coin için relevant haberleri topla
         name_map = {
             "BTC":["bitcoin","btc"], "ETH":["ethereum","ether"],
             "SOL":["solana"], "BNB":["binance","bnb"],
@@ -1525,7 +1368,6 @@ def batch_sentiment(req: BatchSentimentReq):
             "FIL":["filecoin"], "ALGO":["algorand"],
         }
 
-        # Her coin için haber sayısını ve başlıkları derle
         per_coin_news = {}
         for sym in req.symbols:
             s = sym.upper()
@@ -1535,9 +1377,8 @@ def batch_sentiment(req: BatchSentimentReq):
                 title = (n.get("title") or "").lower()
                 if any(k in title for k in keywords):
                     relevant.append(n.get("title"))
-            per_coin_news[s] = relevant[:5]  # her coin için max 5 haber
+            per_coin_news[s] = relevant[:5]
 
-        # Hiç haber olmayan coinler için doğrudan nötr dön, Claude'a sorma
         result = {}
         to_analyze = {}
         for s, news in per_coin_news.items():
@@ -1550,7 +1391,6 @@ def batch_sentiment(req: BatchSentimentReq):
             out = {"success": True, "cached": False, "sentiments": result}
             return out
 
-        # Toplu prompt — tek Claude çağrısı, tüm coinleri birden analiz et
         prompt_parts = ["Aşağıda kripto coinleri için güncel haber başlıkları var. "
                         "Her coin için sentiment skoru (0-100), sentiment etiketi "
                         "(pozitif/negatif/nötr) üret. SADECE aşağıdaki JSON formatında cevap ver:\n\n"]
@@ -1600,7 +1440,6 @@ def batch_sentiment(req: BatchSentimentReq):
             else:
                 result[s] = {"sentiment":"nötr","score":50,"news_count":len(news)}
 
-        # Cache'e yaz
         _batch_sentiment_cache["ts"]   = now
         _batch_sentiment_cache["data"] = {**_batch_sentiment_cache.get("data",{}), **result}
         return {"success": True, "cached": False, "sentiments": result, "analyzed": len(to_analyze)}
@@ -1611,29 +1450,12 @@ def batch_sentiment(req: BatchSentimentReq):
 # ══════════════════════════════════════════════════════════════════════════════
 #   INTELLIGENCE ENGINE — 5 kaynak birleşik analiz
 # ══════════════════════════════════════════════════════════════════════════════
-# Kaynaklar (hepsi ÜCRETSİZ + sınırsız):
-#   1. RSS News      — CoinDesk + CoinTelegraph + Decrypt RSS (sentiment çıkar)
-#   2. Reddit        — r/CryptoCurrency + r/CryptoMoonShots trend
-#   3. DefiLlama     — TVL değişimi (DeFi coinler için)
-#   4. Binance Ann.  — yeni listing duyuruları
-#   5. Whale Alert   — büyük cüzdan hareketleri (RSS)
-#
-# Birleşik intelligence_score 0-100 — şu an istatistiğe dahil değil, gözlemde.
-# Yeterli veri biriktiğinde teknik skora eklenecek.
-#
-# CryptoPanic kaldırıldı (1 Nisan 2026 itibarıyla ücretsiz API kapandı, $50/hafta+)
-# Onun yerine 3 RSS feed'i (CoinDesk + CoinTelegraph + Decrypt) kullanılıyor — 
-# CryptoPanic'in haber kaynaklarının çoğunu zaten bunlar oluşturuyordu.
-# ══════════════════════════════════════════════════════════════════════════════
+_crypto_news_cache  = {"ts": 0, "data": {}}
+_reddit_cache       = {"ts": 0, "data": {}}
+_defillama_cache    = {"ts": 0, "data": {}}
+_binance_ann_cache  = {"ts": 0, "data": []}
+_whale_alert_cache  = {"ts": 0, "data": []}
 
-# Cache'ler — her kaynağın kendi yenileme periyodu var
-_crypto_news_cache  = {"ts": 0, "data": {}}    # 5 dk - CoinDesk/CoinTelegraph/Decrypt RSS
-_reddit_cache       = {"ts": 0, "data": {}}    # 10 dk
-_defillama_cache    = {"ts": 0, "data": {}}    # 30 dk (TVL yavaş değişir)
-_binance_ann_cache  = {"ts": 0, "data": []}    # 15 dk
-_whale_alert_cache  = {"ts": 0, "data": []}    # 5 dk
-
-# Coin sembol algılama — haber başlık/içeriğinden
 COIN_PATTERNS = {
     "BTC": ["BITCOIN", "BTC"],
     "ETH": ["ETHEREUM", "ETH", "ETHER"],
@@ -1672,7 +1494,6 @@ COIN_PATTERNS = {
     "HBAR": ["HEDERA", "HBAR"],
 }
 
-# Pozitif/negatif kelime listeleri (RSS sentiment için)
 POSITIVE_WORDS = {"surge","surges","rally","rallies","bullish","gains","soar","soars",
                   "moon","breakthrough","adoption","pump","green","rise","rising",
                   "higher","ath","record","approve","approval","launch","integrate",
@@ -1686,11 +1507,6 @@ NEGATIVE_WORDS = {"crash","crashes","plunge","plunges","bearish","drop","drops",
 
 
 def fetch_crypto_news_rss():
-    """
-    CoinDesk + CoinTelegraph + Decrypt RSS feed'lerinden son 100 haberi çek.
-    Coin sembolü + sentiment çıkar.
-    CryptoPanic ücretli oldu, bu 3 kaynak birlikte aynı işi görüyor (ücretsiz).
-    """
     now = time.time()
     if _crypto_news_cache["data"] and now - _crypto_news_cache["ts"] < 300:
         return _crypto_news_cache["data"]
@@ -1711,10 +1527,8 @@ def fetch_crypto_news_rss():
             print(f"{source_name} RSS hatası: {e}")
             continue
         
-        # <item> blokları çıkar
         items = re.findall(r'<item[^>]*>(.+?)</item>', xml_text, re.DOTALL)
-        for item in items[:30]:  # ilk 30 haber per kaynak
-            # Title - CDATA veya plain
+        for item in items[:30]:
             title_m = (re.search(r'<title><!\[CDATA\[(.+?)\]\]></title>', item) or 
                        re.search(r'<title[^>]*>(.+?)</title>', item))
             desc_m  = (re.search(r'<description><!\[CDATA\[(.+?)\]\]></description>', item) or 
@@ -1724,10 +1538,9 @@ def fetch_crypto_news_rss():
             if not title_m:
                 continue
             
-            title = re.sub(r'<[^>]+>', '', title_m.group(1)).strip()  # HTML tag temizle
+            title = re.sub(r'<[^>]+>', '', title_m.group(1)).strip()
             desc  = re.sub(r'<[^>]+>', '', desc_m.group(1)).strip() if desc_m else ""
             
-            # Tarih kontrolü — son 24 saat
             pub_ts = 0
             if date_m:
                 try:
@@ -1735,17 +1548,15 @@ def fetch_crypto_news_rss():
                     pub_ts = parsedate_to_datetime(date_m.group(1)).timestamp()
                 except Exception:
                     pass
-            if pub_ts and (now - pub_ts) > 86400:  # 24 saat üstü atla
+            if pub_ts and (now - pub_ts) > 86400:
                 continue
             
             full_text = (title + " " + desc).upper()
             full_lower = full_text.lower()
             
-            # Coin tespit
             mentioned = []
             for sym, patterns in COIN_PATTERNS.items():
                 for pat in patterns:
-                    # Word boundary kontrolü
                     if re.search(r'\b' + re.escape(pat) + r'\b', full_text):
                         mentioned.append(sym)
                         break
@@ -1753,7 +1564,6 @@ def fetch_crypto_news_rss():
             if not mentioned:
                 continue
             
-            # Sentiment
             pos = sum(1 for w in POSITIVE_WORDS if w in full_lower)
             neg = sum(1 for w in NEGATIVE_WORDS if w in full_lower)
             
@@ -1774,7 +1584,6 @@ def fetch_crypto_news_rss():
                         "sentiment": "pozitif" if pos > neg else "negatif" if neg > pos else "nötr"
                     })
     
-    # set'i listeye çevir (JSON için)
     for sym in coin_data:
         coin_data[sym]["sources"] = sorted(coin_data[sym]["sources"])
     
@@ -1784,13 +1593,11 @@ def fetch_crypto_news_rss():
 
 
 def fetch_reddit_trends():
-    """r/CryptoCurrency + r/CryptoMoonShots'tan trending coinleri sayar."""
     now = time.time()
     if _reddit_cache["data"] and now - _reddit_cache["ts"] < 600:
         return _reddit_cache["data"]
     try:
         coin_mentions = {}
-        # Reddit JSON API — User-Agent zorunlu
         headers = {"User-Agent": "KriptoAI/1.0 (by /u/anon)"}
         for sub in ["CryptoCurrency", "CryptoMoonShots"]:
             try:
@@ -1802,12 +1609,10 @@ def fetch_reddit_trends():
                     title = (pd.get("title", "") + " " + pd.get("selftext", ""))[:500].upper()
                     score = pd.get("score", 0) or 0
                     comments = pd.get("num_comments", 0) or 0
-                    # Yaygın coin sembolleri tara
                     for coin in ["BTC","ETH","SOL","BNB","XRP","ADA","DOGE","AVAX","DOT","LINK",
                                  "UNI","NEAR","APT","SUI","ARB","OP","INJ","HYPE","TAO","PEPE",
                                  "SHIB","BONK","RENDER","FET","WLD","JUP","PENDLE","AAVE","ATOM",
                                  "LTC","FTM","MATIC","AKT","TRX","XMR","HBAR","POL","STRK"]:
-                        # "BTC", "$BTC", "#BTC" eşleşmeleri
                         if (f" {coin} " in f" {title} " or f"${coin}" in title 
                             or f"#{coin}" in title or title.startswith(coin + " ")):
                             if coin not in coin_mentions:
@@ -1827,27 +1632,23 @@ def fetch_reddit_trends():
 
 
 def fetch_defillama_tvl():
-    """DefiLlama'dan ana protokollerin TVL değişimini çek."""
     now = time.time()
     if _defillama_cache["data"] and now - _defillama_cache["ts"] < 1800:
         return _defillama_cache["data"]
     try:
-        # Top 100 protokol — sembol bazlı eşleştirme
         url = "https://api.llama.fi/protocols"
         data = get_ext(url, timeout=15)
         if not isinstance(data, list):
             return {}
-        # Her token için ilgili protokolleri bul, TVL değişim ortalama
-        # Symbol mapping — protokoldeki gov token sembolü
         token_data = {}
-        for proto in data[:300]:  # ilk 300 protokol
+        for proto in data[:300]:
             symbol = (proto.get("symbol") or "").upper().strip("-")
             if not symbol or symbol == "-":
                 continue
             tvl_now    = proto.get("tvl") or 0
             change_1d  = proto.get("change_1d") or 0
             change_7d  = proto.get("change_7d") or 0
-            if tvl_now < 1_000_000:  # $1M altı protokol önemsiz
+            if tvl_now < 1_000_000:
                 continue
             if symbol not in token_data:
                 token_data[symbol] = {
@@ -1855,15 +1656,14 @@ def fetch_defillama_tvl():
                     "protocol_count": 0, "name": proto.get("name", "")
                 }
             token_data[symbol]["tvl"]              += tvl_now
-            token_data[symbol]["tvl_change_1d"]    += change_1d * tvl_now  # ağırlıklı
+            token_data[symbol]["tvl_change_1d"]    += change_1d * tvl_now
             token_data[symbol]["tvl_change_7d"]    += change_7d * tvl_now
             token_data[symbol]["protocol_count"]   += 1
-        # Ağırlıklı ortalamayı hesapla
         for sym, d in token_data.items():
             if d["tvl"] > 0:
                 d["tvl_change_1d"] = round(d["tvl_change_1d"] / d["tvl"], 2)
                 d["tvl_change_7d"] = round(d["tvl_change_7d"] / d["tvl"], 2)
-                d["tvl"] = round(d["tvl"] / 1_000_000, 1)  # $M olarak
+                d["tvl"] = round(d["tvl"] / 1_000_000, 1)
         _defillama_cache["data"] = token_data
         _defillama_cache["ts"]   = now
         return token_data
@@ -1873,14 +1673,10 @@ def fetch_defillama_tvl():
 
 
 def fetch_binance_announcements():
-    """Binance announcement RSS'inden son 30 günde duyurulan listingleri çek."""
     now = time.time()
     if _binance_ann_cache["data"] and now - _binance_ann_cache["ts"] < 900:
         return _binance_ann_cache["data"]
     try:
-        # Binance announcements RSS yok ama API var
-        # https://www.binance.com/bapi/composite/v1/public/cms/article/list/query
-        # Alternatif: zoomic.io veya benzer agregatör — burası fallback
         url = ("https://www.binance.com/bapi/composite/v1/public/cms/article/list/query"
                "?type=1&pageNo=1&pageSize=30&catalogId=48")
         data = get_ext(url, timeout=10)
@@ -1892,12 +1688,9 @@ def fetch_binance_announcements():
             release = a.get("releaseDate", 0) or 0
             if release < cutoff:
                 continue
-            # "Binance Will List XXX" pattern'i ara
             up = title.upper()
             if "WILL LIST" in up or "LISTING" in up or "LISTS" in up:
-                # Coin sembolünü çıkar
                 import re
-                # Parantez içi sembol: "Binance Will List Foo (BAR)"
                 m = re.search(r'\(([A-Z0-9]{2,10})\)', title)
                 if m:
                     listings.append({
@@ -1914,20 +1707,16 @@ def fetch_binance_announcements():
 
 
 def fetch_whale_alerts():
-    """Whale Alert RSS — son 24 saat büyük cüzdan hareketleri."""
     now = time.time()
     if _whale_alert_cache["data"] and now - _whale_alert_cache["ts"] < 300:
         return _whale_alert_cache["data"]
     try:
-        # Whale Alert RSS — ücretsiz, paywall yok
         url = "https://whale-alert.io/feed/all"
-        # Bu RSS — XML parse gerekiyor
         try:
             with urllib.request.urlopen(url, timeout=10) as r:
                 xml_text = r.read().decode("utf-8", errors="ignore")
         except Exception:
             return _whale_alert_cache["data"] or []
-        # Basit XML parse — <title> içine <coin> ve $miktar
         import re
         items = re.findall(r'<item>(.+?)</item>', xml_text, re.DOTALL)
         alerts = []
@@ -1947,13 +1736,12 @@ def fetch_whale_alerts():
                     pass
             if ts and ts < cutoff:
                 continue
-            # "1,234 BTC ($45,678,912 USD) transferred from..." pattern
             coin_m = re.search(r'#([A-Z]{2,10})', title)
             usd_m  = re.search(r'\$(\d[\d,]*)', title)
             if coin_m and usd_m:
                 try:
                     usd = int(usd_m.group(1).replace(",", ""))
-                    if usd >= 1_000_000:  # $1M+ harekat
+                    if usd >= 1_000_000:
                         alerts.append({
                             "symbol": coin_m.group(1),
                             "usd": usd,
@@ -1972,23 +1760,17 @@ def fetch_whale_alerts():
 
 @app.get("/api/intelligence/{symbol}")
 def intelligence(symbol: str):
-    """
-    Tek coin için 5 kaynaklı zenginleştirilmiş analiz.
-    Skor 0-100 arası — şu an gözlem amaçlı, sinyale dahil değil.
-    """
     sym = symbol.upper()
     try:
-        # 5 kaynaktan veri çek (cache sayesinde hızlı)
-        news_data  = fetch_crypto_news_rss()  # CoinDesk + CoinTelegraph + Decrypt
+        news_data  = fetch_crypto_news_rss()
         rd_data    = fetch_reddit_trends()
         tvl_data   = fetch_defillama_tvl()
         ann_data   = fetch_binance_announcements()
         whale_data = fetch_whale_alerts()
 
         signals = []
-        score   = 50  # nötr başla
+        score   = 50
 
-        # ── 1. RSS haber sentiment (CoinDesk + CoinTelegraph + Decrypt) ──
         nd = news_data.get(sym, {})
         news_count = nd.get("news_count", 0)
         n_pos = nd.get("positive", 0)
@@ -1996,7 +1778,6 @@ def intelligence(symbol: str):
         sources = nd.get("sources", [])
         if news_count > 0:
             net = n_pos - n_neg
-            # Çoklu kaynak çarpanı — 3 kaynak da yazıyorsa daha güvenilir
             multi_source = len(sources) >= 2
             if net >= 5:
                 bonus = 14 if multi_source else 10
@@ -2015,7 +1796,6 @@ def intelligence(symbol: str):
                 score += 3
                 signals.append(f"📰 Haber yoğun ({news_count})")
 
-        # ── 2. Reddit trend ────────────────────────────────────
         rd = rd_data.get(sym, {})
         rd_mentions = rd.get("mentions", 0)
         rd_score    = rd.get("score", 0)
@@ -2029,7 +1809,6 @@ def intelligence(symbol: str):
             score += 3
             signals.append(f"💬 Reddit'te ilgi (+{rd_score} upvote)")
 
-        # ── 3. DefiLlama TVL ───────────────────────────────────
         tvl = tvl_data.get(sym, {})
         if tvl.get("tvl", 0) > 0:
             tvl_7d = tvl.get("tvl_change_7d", 0)
@@ -2046,17 +1825,14 @@ def intelligence(symbol: str):
                 score -= 6
                 signals.append(f"🔴 TVL {tvl_7d}% (7g)")
 
-        # ── 4. Binance yeni listing ────────────────────────────
         for ann in ann_data:
             if ann["symbol"] == sym:
-                # 7 gün içinde duyuru → büyük etki
                 age_hours = (time.time() - ann["released"]/1000) / 3600
-                if age_hours < 168:  # 7 gün
+                if age_hours < 168:
                     score += 25
                     signals.append(f"🆕 Binance listing! ({int(age_hours)}h önce)")
                     break
 
-        # ── 5. Whale Alert ─────────────────────────────────────
         sym_alerts = [a for a in whale_data if a["symbol"] == sym]
         if sym_alerts:
             total_usd = sum(a["usd"] for a in sym_alerts)
@@ -2111,13 +1887,8 @@ def intelligence(symbol: str):
 
 @app.get("/api/intelligence-batch")
 def intelligence_batch(symbols: str):
-    """
-    Birden çok coin için intelligence skor — daha verimli.
-    Frontend dinamik tarama'da bunu çağırır.
-    """
     try:
         sym_list = [s.strip().upper() for s in symbols.split(",") if s.strip()][:50]
-        # Veriler ortak — bir kez çek
         news_data  = fetch_crypto_news_rss()
         rd_data    = fetch_reddit_trends()
         tvl_data   = fetch_defillama_tvl()
@@ -2129,7 +1900,6 @@ def intelligence_batch(symbols: str):
             score = 50
             signals = []
             
-            # RSS news (CoinDesk + CoinTelegraph + Decrypt)
             nd = news_data.get(sym, {})
             news_count = nd.get("news_count", 0)
             net = (nd.get("positive", 0) - nd.get("negative", 0))
@@ -2145,13 +1915,11 @@ def intelligence_batch(symbols: str):
             elif net <= -2:
                 score -= 6
             
-            # Reddit
             rd = rd_data.get(sym, {})
             m = rd.get("mentions", 0)
             if m >= 5:   score += 10; signals.append(f"🔥 Reddit trend ({m})")
             elif m >= 3: score += 5
             
-            # DefiLlama
             tvl = tvl_data.get(sym, {})
             tvl_7d = tvl.get("tvl_change_7d", 0) if tvl else 0
             if tvl_7d > 30:    score += 15; signals.append(f"🟢 TVL +{tvl_7d}%")
@@ -2159,14 +1927,12 @@ def intelligence_batch(symbols: str):
             elif tvl_7d < -20: score -= 12; signals.append(f"🔴 TVL {tvl_7d}%")
             elif tvl_7d < -10: score -= 6
             
-            # Binance listing
             for a in ann_data:
                 if a["symbol"] == sym and (time.time() - a["released"]/1000) < 168*3600:
                     score += 25
                     signals.append("🆕 Yeni listing")
                     break
             
-            # Whale
             alerts = [w for w in whale_data if w["symbol"] == sym]
             if alerts:
                 total = sum(a["usd"] for a in alerts)
@@ -2183,3 +1949,261 @@ def intelligence_batch(symbols: str):
         return {"success": True, "intelligence": result, "count": len(result)}
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ▼▼▼ YENİ EKLENEN 3 ENDPOINT — 6-KAYNAK GÜVEN SİSTEMİ İÇİN ▼▼▼
+# ══════════════════════════════════════════════════════════════════════════════
+# Tarih: 2026-04
+# Eklenenler:
+#   1. /api/futures-metrics  → Binance Futures funding/OI/L-S
+#   2. /api/trending-coins   → CoinGecko trending coins
+#   3. /api/sectors          → CoinGecko sektör performansı
+#
+# Tüm cache'ler ayrı, mevcut endpoint'lere DOKUNULMADI.
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#                  ENDPOINT: /api/futures-metrics
+# ══════════════════════════════════════════════════════════════════════════════
+# Binance Futures Public API üzerinden funding rate + OI + Long/Short ratio.
+# Tüm coinler için tek toplu çağrı (premium index) + coin-spesifik OI/L-S.
+# 3 dakika cache (rate limit + Render hızı).
+
+_futures_cache = {"ts": 0, "key": "", "data": None}
+
+@app.get("/api/futures-metrics")
+def futures_metrics(symbols: str = ""):
+    """
+    Binance Futures'tan funding rate + OI + L/S oranı.
+
+    Funding rate < -0.05% → short squeeze potansiyeli (AL fırsatı)
+    Funding rate > +0.10% → long squeeze riski (DİKKAT)
+    OI artışı = yeni para giriyor
+    L/S > 3.5 = aşırı long, contrarian SAT sinyali
+    L/S < 0.5 = aşırı short, contrarian AL sinyali
+    """
+    try:
+        now = time.time()
+        sym_list = [s.strip().upper() for s in symbols.split(",") if s.strip()][:50]
+        if not sym_list:
+            return {"success": False, "error": "symbols param gerekli", "metrics": {}}
+
+        cache_key = ",".join(sorted(sym_list))
+        if (_futures_cache["data"] and
+            _futures_cache["key"] == cache_key and
+            now - _futures_cache["ts"] < 180):
+            return {**_futures_cache["data"], "cached": True}
+
+        # 1) Tüm funding rate'leri tek çağrıda (premium index)
+        all_funding = {}
+        try:
+            data = get_pub("/fapi/v1/premiumIndex", base=FUTURES_BASE, timeout=15)
+            if isinstance(data, list):
+                for item in data:
+                    sym_full = item.get("symbol", "")
+                    if sym_full.endswith("USDT"):
+                        all_funding[sym_full[:-4]] = {
+                            "funding_rate": float(item.get("lastFundingRate", 0)) * 100,
+                            "mark_price":   float(item.get("markPrice", 0)),
+                        }
+        except Exception as e:
+            print(f"[futures] premium index hata: {e}")
+
+        # 2) Her sembol için OI ve L/S — sadece istenen semboller
+        result = {}
+        for sym in sym_list:
+            metrics = {
+                "funding_rate":     None,
+                "oi_change_pct":    None,
+                "long_short_ratio": None,
+                "signal":           "neutral",
+                "alerts":           [],
+            }
+
+            # Funding (cache'den)
+            if sym in all_funding:
+                fr = all_funding[sym]["funding_rate"]
+                metrics["funding_rate"] = round(fr, 4)
+                if fr < -0.05:
+                    metrics["alerts"].append(f"💎 Negatif funding {fr:.3f}% — short squeeze")
+                    metrics["signal"] = "bullish"
+                elif fr > 0.10:
+                    metrics["alerts"].append(f"⚠️ Yüksek funding {fr:.3f}% — long squeeze riski")
+                    metrics["signal"] = "bearish"
+                elif fr > 0.05:
+                    metrics["alerts"].append(f"⚠ Funding {fr:.3f}% yüksek")
+
+            pair = sym + "USDT"
+
+            # OI değişim — son 1 saat
+            try:
+                oi_data = get_pub("/futures/data/openInterestHist",
+                    {"symbol": pair, "period": "1h", "limit": 2},
+                    base=FUTURES_BASE, timeout=10)
+                if isinstance(oi_data, list) and len(oi_data) >= 2:
+                    oi_now  = float(oi_data[-1].get("sumOpenInterest", 0))
+                    oi_prev = float(oi_data[-2].get("sumOpenInterest", 0))
+                    if oi_prev > 0:
+                        oi_change = (oi_now - oi_prev) / oi_prev * 100
+                        metrics["oi_change_pct"] = round(oi_change, 2)
+                        if oi_change > 5:
+                            metrics["alerts"].append(f"📈 OI +{oi_change:.1f}% — yeni para giriyor")
+                            if metrics["signal"] == "neutral":
+                                metrics["signal"] = "bullish"
+                        elif oi_change < -5:
+                            metrics["alerts"].append(f"📉 OI {oi_change:.1f}% — pozisyon kapanıyor")
+            except Exception:
+                pass
+
+            # Long/Short ratio
+            try:
+                ls_data = get_pub("/futures/data/globalLongShortAccountRatio",
+                    {"symbol": pair, "period": "1h", "limit": 1},
+                    base=FUTURES_BASE, timeout=10)
+                if isinstance(ls_data, list) and ls_data:
+                    ls = float(ls_data[0].get("longShortRatio", 1.0))
+                    metrics["long_short_ratio"] = round(ls, 2)
+                    if ls > 3.5:
+                        metrics["alerts"].append(f"🐂 L/S {ls:.1f} — aşırı long, contrarian SAT")
+                        metrics["signal"] = "bearish"
+                    elif ls < 0.5:
+                        metrics["alerts"].append(f"🐻 L/S {ls:.2f} — aşırı short, AL fırsatı")
+                        metrics["signal"] = "bullish"
+            except Exception:
+                pass
+
+            result[sym] = metrics
+
+        out = {
+            "success":   True,
+            "metrics":   result,
+            "timestamp": int(now * 1000),
+            "cached":    False,
+        }
+        _futures_cache["data"] = out
+        _futures_cache["ts"]   = now
+        _futures_cache["key"]  = cache_key
+        return out
+    except Exception as e:
+        traceback.print_exc()
+        if _futures_cache["data"]:
+            return {**_futures_cache["data"], "cached": True, "error": str(e)}
+        return {"success": False, "error": str(e), "metrics": {}}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#                  ENDPOINT: /api/trending-coins
+# ══════════════════════════════════════════════════════════════════════════════
+# CoinGecko trending — son 24 saatte en çok aranan 7-15 coin.
+# Retail FOMO göstergesi, özellikle memecoin pump tespiti için.
+# 30 dakika cache (CoinGecko free 30 req/dk, sorun olmaz).
+
+_trending_cache = {"ts": 0, "data": None}
+
+@app.get("/api/trending-coins")
+def trending_coins():
+    """CoinGecko trending coins — retail ilgi göstergesi."""
+    try:
+        now = time.time()
+        if _trending_cache["data"] and now - _trending_cache["ts"] < 1800:
+            return {**_trending_cache["data"], "cached": True}
+
+        data = get_ext("https://api.coingecko.com/api/v3/search/trending", timeout=15)
+        coins = data.get("coins", [])
+
+        result = []
+        for i, item in enumerate(coins[:15]):
+            c = item.get("item", {})
+            symbol = (c.get("symbol") or "").upper()
+            if not symbol:
+                continue
+            result.append({
+                "symbol":          symbol,
+                "name":            c.get("name", ""),
+                "market_cap_rank": c.get("market_cap_rank") or 0,
+                "rank":            i + 1,
+                "thumb":           c.get("thumb", ""),
+                "score":           c.get("score", 0),
+            })
+
+        out = {
+            "success":   True,
+            "trending":  result,
+            "count":     len(result),
+            "timestamp": int(now * 1000),
+            "cached":    False,
+        }
+        _trending_cache["data"] = out
+        _trending_cache["ts"]   = now
+        return out
+    except Exception as e:
+        if _trending_cache["data"]:
+            return {**_trending_cache["data"], "cached": True, "error": str(e)}
+        return {"success": False, "error": str(e), "trending": []}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#                  ENDPOINT: /api/sectors
+# ══════════════════════════════════════════════════════════════════════════════
+# CoinGecko kategori performansı — AI/DeFi/Layer1/Meme sektörleri 24h.
+# Sektör rotation tespiti için kritik.
+# 1 saat cache (sektör yavaş değişir).
+
+_sectors_cache = {"ts": 0, "data": None}
+
+@app.get("/api/sectors")
+def sectors():
+    """CoinGecko sektör (kategori) performansı."""
+    try:
+        now = time.time()
+        if _sectors_cache["data"] and now - _sectors_cache["ts"] < 3600:
+            return {**_sectors_cache["data"], "cached": True}
+
+        data = get_ext("https://api.coingecko.com/api/v3/coins/categories", timeout=15)
+
+        relevant_keywords = [
+            "artificial-intelligence", "ai-meme",
+            "decentralized-finance-defi", "decentralized-exchange",
+            "layer-1", "layer-2", "smart-contract-platform",
+            "meme-token", "gaming",
+            "real-world-assets-rwa", "infrastructure",
+        ]
+
+        result = []
+        for cat in data:
+            cat_id = cat.get("id", "")
+            if not any(kw in cat_id for kw in relevant_keywords):
+                continue
+            mc_change_24h = cat.get("market_cap_change_24h") or 0
+            volume = cat.get("volume_24h") or 0
+            mc = cat.get("market_cap") or 0
+            if mc < 100_000_000:
+                continue
+            result.append({
+                "id":           cat_id,
+                "name":         cat.get("name", ""),
+                "market_cap_b": round(mc / 1e9, 2),
+                "volume_24h_m": round(volume / 1e6, 0),
+                "change_24h":   round(mc_change_24h, 2),
+                "top_3_coins":  cat.get("top_3_coins_id", [])[:3],
+            })
+
+        result.sort(key=lambda x: x["change_24h"], reverse=True)
+
+        out = {
+            "success":      True,
+            "sectors":      result[:12],
+            "best_sector":  result[0] if result else None,
+            "worst_sector": result[-1] if result else None,
+            "timestamp":    int(now * 1000),
+            "cached":       False,
+        }
+        _sectors_cache["data"] = out
+        _sectors_cache["ts"]   = now
+        return out
+    except Exception as e:
+        if _sectors_cache["data"]:
+            return {**_sectors_cache["data"], "cached": True, "error": str(e)}
+        return {"success": False, "error": str(e), "sectors": []}
