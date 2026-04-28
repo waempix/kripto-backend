@@ -2163,12 +2163,25 @@ def sectors():
 
         data = get_ext("https://api.coingecko.com/api/v3/coins/categories", timeout=15)
 
+        # CoinGecko kategori ID'leri zaman zaman değişir (meme-token → meme-coin gibi).
+        # Bu yüzden geniş bir keyword listesi tutuyoruz — kelimenin geçtiği her ID dahil.
         relevant_keywords = [
-            "artificial-intelligence", "ai-meme",
-            "decentralized-finance-defi", "decentralized-exchange",
-            "layer-1", "layer-2", "smart-contract-platform",
-            "meme-token", "gaming",
+            # AI
+            "artificial-intelligence", "ai-meme", "ai-agent",
+            # DeFi
+            "decentralized-finance-defi", "decentralized-exchange", "defi",
+            "yield", "lending", "liquid-staking",
+            # Layers
+            "layer-1", "layer-2", "smart-contract-platform", "rollup",
+            # Memes (her türlü varyasyon)
+            "meme", "meme-token", "meme-coin", "memes",
+            "dog-themed", "cat-themed", "frog-themed",
+            # Gaming
+            "gaming", "gamefi", "play-to-earn", "metaverse",
+            # Diğer önemli sektörler
             "real-world-assets-rwa", "infrastructure",
+            "depin", "dePIN", "rwa",
+            "solana-ecosystem", "ethereum-ecosystem", "base-ecosystem",
         ]
 
         result = []
@@ -2179,7 +2192,8 @@ def sectors():
             mc_change_24h = cat.get("market_cap_change_24h") or 0
             volume = cat.get("volume_24h") or 0
             mc = cat.get("market_cap") or 0
-            if mc < 100_000_000:
+            # Eşiği gevşettik — küçük sektörler de dahil olsun ($10M)
+            if mc < 10_000_000:
                 continue
             result.append({
                 "id":           cat_id,
@@ -2194,7 +2208,7 @@ def sectors():
 
         out = {
             "success":      True,
-            "sectors":      result[:12],
+            "sectors":      result[:25],  # 12 → 25 (daha çok sektör görünsün)
             "best_sector":  result[0] if result else None,
             "worst_sector": result[-1] if result else None,
             "timestamp":    int(now * 1000),
