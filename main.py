@@ -2221,3 +2221,498 @@ def sectors():
         if _sectors_cache["data"]:
             return {**_sectors_cache["data"], "cached": True, "error": str(e)}
         return {"success": False, "error": str(e), "sectors": []}
+
+# ════════════════════════════════════════════════════════════════════════════════
+#                          7/24 SİNYAL TRACKER MODÜLÜ
+# ════════════════════════════════════════════════════════════════════════════════
+# Bu modül backend'de sürekli çalışır ve frontend'den bağımsız:
+#   - Her 5 dakikada Binance'ten fiyat çeker, skoru hesaplar
+#   - Skor 68+ olan coinleri Firebase'e signalHistory'ye ekler (24h cooldown)
+#   - Her 30 saniyede bekleyen sinyalleri kontrol eder (SL/TP/TIME)
+#   - Yeni sinyal/exit olunca Telegram bildirimi gönderir
+#   - Frontend sadece /api/tracker/signals'tan okur
+# ════════════════════════════════════════════════════════════════════════════════
+
+import threading
+
+# ── Firebase Admin SDK ───────────────────────────────────────────────────────
+_firebase_db = None
+_firebase_init_error = None
+
+def _init_firebase():
+    """Firebase Admin SDK'yı başlatır. FIREBASE_CREDENTIALS env'i bekler."""
+    global _firebase_db, _firebase_init_error
+    if _firebase_db is not None:
+        return _firebase_db
+
+    try:
+        creds_str = os.environ.get("FIREBASE_CREDENTIALS", "")
+        if not creds_str:
+            _firebase_init_error = "FIREBASE_CREDENTIALS env eksik"
+            return None
+
+        import firebase_admin
+        from firebase_admin import credentials, firestore
+
+        # Aynı app birden fazla initialize edilemez
+        if not firebase_admin._apps:
+            creds_dict = json.loads(creds_str)
+            cred = credentials.Certificate(creds_dict)
+            firebase_admin.initialize_app(cred)
+
+        _firebase_db = firestore.client()
+        print("[TRACKER] ✅ Firebase Admin başlatıldı")
+        return _firebase_db
+    except Exception as e:
+        _firebase_init_error = str(e)
+        print(f"[TRACKER] ❌ Firebase başlatma hatası: {e}")
+        return None
+
+def _fb_get_signals():
+    """Firebase'den signalHistory dizisini çeker. Bulamazsa boş liste."""
+    db = _init_firebase()
+    if not db:
+        return []
+    try:
+        doc = db.collection("users").document("user_main").get()
+        if not doc.exists:
+            return []
+        data = doc.to_dict() or {}
+        return data.get("signalHistory", []) or []
+    except Exception as e:
+        print(f"[TRACKER] ❌ Firebase okuma hatası: {e}")
+        return []
+
+def _fb_set_signals(signals):
+    """signalHistory'yi Firebase'e yazar (merge ile diğer alanları korur)."""
+    db = _init_firebase()
+    if not db:
+        return False
+    try:
+        # Son 30 gün, max 500 kayıt
+        cutoff = int((time.time() - 30 * 24 * 60 * 60) * 1000)
+        trimmed = [s for s in signals if s.get("ts", 0) > cutoff][-500:]
+        db.collection("users").document("user_main").set(
+            {"signalHistory": trimmed}, merge=True
+        )
+        return True
+    except Exception as e:
+        print(f"[TRACKER] ❌ Firebase yazma hatası: {e}")
+        return False
+
+# ── Telegram bildirimi ───────────────────────────────────────────────────────
+def _tg_notify(text):
+    """Telegram'a mesaj gönder. Hata olursa sessizce geç."""
+    if not TG_TOKEN or not TG_CHAT_ID:
+        return False
+    try:
+        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+        data = urllib.parse.urlencode({
+            "chat_id": TG_CHAT_ID,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": "true",
+        }).encode()
+        r = urllib.request.Request(url, data=data, method="POST")
+        with urllib.request.urlopen(r, timeout=8) as res:
+            return res.status == 200
+    except Exception as e:
+        print(f"[TRACKER] Telegram hatası: {e}")
+        return False
+
+# ── Tracker durumu (frontend için) ───────────────────────────────────────────
+_tracker_state = {
+    "running":          False,
+    "last_scan":        0,
+    "last_exit_check":  0,
+    "scans_done":       0,
+    "exits_done":       0,
+    "signals_added":    0,
+    "errors":           [],
+    "started_at":       0,
+}
+
+def _log_error(prefix, err):
+    msg = f"[{datetime.now().strftime('%H:%M:%S')}] {prefix}: {err}"
+    print(f"[TRACKER] ❌ {msg}")
+    _tracker_state["errors"].append(msg)
+    _tracker_state["errors"] = _tracker_state["errors"][-20:]
+
+# ── Skor hesaplama yardımcıları ──────────────────────────────────────────────
+def _exit_params(score):
+    """Skor bandına göre SL/TP/MaxHours."""
+    if score >= 75:
+        return {"sl": -4.0, "tp1": 8.0, "tp2": 15.0, "max_hours": 96}
+    if score >= 65:
+        return {"sl": -3.5, "tp1": 6.0, "tp2": 12.0, "max_hours": 72}
+    return {"sl": -3.0, "tp1": 5.0, "tp2": 10.0, "max_hours": 48}
+
+def _get_current_prices():
+    """Tüm Binance USDT pair'lerinin son fiyatını getir."""
+    try:
+        tickers = get_pub("/api/v3/ticker/price")
+        prices = {}
+        for t in tickers:
+            sym = t["symbol"]
+            if sym.endswith("USDT"):
+                prices[sym[:-4]] = float(t["price"])
+        return prices
+    except Exception as e:
+        _log_error("Fiyat çekme", e)
+        return {}
+
+# ── EXIT KONTROL — bekleyen sinyalleri kapat ────────────────────────────────
+def _check_exits():
+    """Bekleyen sinyalleri SL/TP/TIME kuralları ile kontrol eder."""
+    try:
+        signals = _fb_get_signals()
+        prices = _get_current_prices()
+        if not prices:
+            return
+
+        now_ms = int(time.time() * 1000)
+        FORCE_CLOSE_HOURS = 96
+        changed = False
+        exits_log = []
+
+        for h in signals:
+            if h.get("verified"):
+                continue
+
+            sym = h.get("sym", "")
+            entry = h.get("entry", 0)
+            ts = h.get("ts", 0)
+
+            if not entry or entry <= 0 or not ts:
+                continue
+
+            age_ms = now_ms - ts
+            age_h = age_ms / (60 * 60 * 1000)
+
+            # Fiyat eşleştirme — birden fazla format dene
+            cur = prices.get(sym)
+            if cur is None and sym.endswith("USDT"):
+                cur = prices.get(sym[:-4])
+            if cur is None:
+                cur = prices.get(sym + "USDT")
+
+            # Fiyat yoksa ve 96 saat geçtiyse zorla kapat
+            if cur is None:
+                if age_h >= FORCE_CLOSE_HOURS:
+                    h["exit"] = entry
+                    h["change"] = 0
+                    h["success"] = False
+                    h["verified"] = True
+                    h["verifiedAt"] = now_ms
+                    h["exitReason"] = "NO_PRICE"
+                    h["holdHours"] = round(age_h)
+                    changed = True
+                    exits_log.append(f"{sym} NO_PRICE")
+                continue
+
+            pct = ((cur - entry) / entry) * 100
+            params = _exit_params(h.get("score", 68))
+
+            # Trailing stop için zirve takibi
+            peak = h.get("peakPrice", 0)
+            if not peak or cur > peak:
+                h["peakPrice"] = cur
+                h["peakPct"] = pct
+                changed = True
+
+            peak_pct = h.get("peakPct", 0)
+            exit_reason = None
+
+            # 1) STOP-LOSS
+            if pct <= params["sl"]:
+                exit_reason = "SL"
+            # 2) TP2
+            elif pct >= params["tp2"]:
+                exit_reason = "TP2"
+            # 3) TRAILING — zirveden 3% düştü ve TP1'e ulaşmıştı
+            elif peak_pct >= params["tp1"] and (peak_pct - pct) >= 3:
+                exit_reason = "TRAIL"
+            # 4) MAX TIME
+            elif age_h >= params["max_hours"]:
+                exit_reason = "TIME"
+            # 5) ZORUNLU (96h)
+            elif age_h >= FORCE_CLOSE_HOURS:
+                exit_reason = "TIME"
+
+            if exit_reason:
+                h["exit"] = cur
+                h["change"] = round(pct, 2)
+                h["success"] = pct > 0
+                h["verified"] = True
+                h["verifiedAt"] = now_ms
+                h["exitReason"] = exit_reason
+                h["holdHours"] = round(age_h)
+                changed = True
+                exits_log.append(f"{sym} {exit_reason} {pct:+.2f}%")
+
+                # Telegram bildirimi
+                emoji = "✅" if pct > 0 else "❌"
+                _tg_notify(
+                    f"{emoji} <b>{sym}</b> kapandı\n"
+                    f"Skor: {h.get('score', '?')}\n"
+                    f"Sebep: {exit_reason}\n"
+                    f"Giriş: ${entry:.6g}\n"
+                    f"Çıkış: ${cur:.6g}\n"
+                    f"Değişim: <b>{pct:+.2f}%</b>\n"
+                    f"Süre: {round(age_h)}sa"
+                )
+
+        if changed:
+            _fb_set_signals(signals)
+            _tracker_state["exits_done"] += len(exits_log)
+            if exits_log:
+                print(f"[TRACKER] 🎯 Exits: {', '.join(exits_log)}")
+        _tracker_state["last_exit_check"] = int(time.time())
+    except Exception as e:
+        _log_error("Exit kontrolü", e)
+
+# ── SİNYAL TARAMA — yeni AL fırsatları ─────────────────────────────────────
+def _scan_for_signals():
+    """Backend'in /api/signals endpoint'ini çağırır, skor 68+ olanları kaydet."""
+    try:
+        # Mevcut sinyalleri çek
+        existing = _fb_get_signals()
+        now_ms = int(time.time() * 1000)
+        cooldown_ms = 24 * 60 * 60 * 1000
+
+        # Her sembol için son sinyal zamanı (verified+pending fark etmez)
+        last_by_sym = {}
+        for h in existing:
+            sym = h.get("sym", "")
+            ts = h.get("ts", 0)
+            if sym and ts > last_by_sym.get(sym, 0):
+                last_by_sym[sym] = ts
+
+        # Sabit COINS listesi (frontend'dekiyle aynı)
+        SCAN_SYMBOLS = [
+            "BTC", "ETH", "BNB", "SOL", "XRP",
+            "AVAX", "NEAR", "SUI", "INJ", "APT",
+            "ARB", "OP", "STRK", "POL",
+            "LINK", "AAVE", "HYPE", "PENDLE", "JUP", "UNI",
+            "TAO", "AKT", "RENDER", "FET", "WLD",
+            "IMX", "DOGE", "PEPE", "BONK", "SHIB",
+        ]
+
+        # Mevcut /api/signals endpoint'ini iç olarak çağırırsak skor üretir,
+        # ama kendi içinde fiyat ve indikatör çekiyor. Daha basit yol:
+        # Direkt smart_score'u her sembol için çağıralım.
+        added = 0
+        skipped_cooldown = 0
+        new_signals_summary = []
+        prices = _get_current_prices()
+
+        for sym in SCAN_SYMBOLS:
+            try:
+                # Cooldown kontrolü
+                last_ts = last_by_sym.get(sym, 0)
+                if now_ms - last_ts < cooldown_ms:
+                    skipped_cooldown += 1
+                    continue
+
+                # Skoru hesapla
+                result = compute_smart_score(sym)
+                if not result or not result.get("success"):
+                    continue
+
+                score = result.get("score", 0)
+                if score < 68:
+                    continue
+
+                price = prices.get(sym)
+                if not price or price <= 0:
+                    continue
+
+                # Yeni sinyal ekle
+                new_sig = {
+                    "sym":       sym,
+                    "score":     score,
+                    "techScore": result.get("tech_score", score),
+                    "signal":    result.get("rec", "AL"),
+                    "entry":     price,
+                    "ts":        now_ms,
+                    "verified":  False,
+                }
+                existing.append(new_sig)
+                last_by_sym[sym] = now_ms
+                added += 1
+                new_signals_summary.append(f"{sym}({score})")
+
+                # Telegram bildirimi
+                _tg_notify(
+                    f"🔔 <b>YENİ AL SİNYALİ</b>\n"
+                    f"<b>{sym}</b> · Skor: {score}\n"
+                    f"Giriş: <b>${price:.6g}</b>\n"
+                    f"RSI: {result.get('rsi', '—')} · "
+                    f"MACD: {'🟢' if result.get('macd', 0) == 1 else '🔴'}\n"
+                    f"Sebep: {', '.join(result.get('reasons', [])[:3])}"
+                )
+            except Exception as e:
+                _log_error(f"Sembol {sym} taraması", e)
+                continue
+
+        if added > 0:
+            _fb_set_signals(existing)
+            _tracker_state["signals_added"] += added
+            print(f"[TRACKER] 📝 {added} yeni: {', '.join(new_signals_summary)} (cooldown: {skipped_cooldown})")
+        elif skipped_cooldown > 0:
+            print(f"[TRACKER] 📝 0 yeni, {skipped_cooldown} cooldown'da")
+
+        _tracker_state["last_scan"] = int(time.time())
+        _tracker_state["scans_done"] += 1
+    except Exception as e:
+        _log_error("Sinyal taraması", e)
+
+# ── BACKGROUND THREAD ────────────────────────────────────────────────────────
+def _tracker_loop():
+    """Sürekli çalışan ana döngü. Exit her 30sn, scan her 5dk."""
+    print("[TRACKER] 🚀 Background thread başladı")
+    _tracker_state["running"] = True
+    _tracker_state["started_at"] = int(time.time())
+
+    last_scan = 0
+    SCAN_INTERVAL = 300       # 5 dakika
+    EXIT_INTERVAL = 30        # 30 saniye
+
+    while True:
+        try:
+            now = time.time()
+
+            # Her 30 saniyede exit check
+            _check_exits()
+
+            # Her 5 dakikada scan
+            if now - last_scan >= SCAN_INTERVAL:
+                _scan_for_signals()
+                last_scan = now
+
+            time.sleep(EXIT_INTERVAL)
+        except Exception as e:
+            _log_error("Ana döngü", e)
+            time.sleep(EXIT_INTERVAL)
+
+# ── BAŞLATMA — uygulama yüklendiğinde thread'i çalıştır ──────────────────────
+_tracker_thread_started = False
+
+@app.on_event("startup")
+def _start_tracker():
+    global _tracker_thread_started
+    if _tracker_thread_started:
+        return
+    if not os.environ.get("FIREBASE_CREDENTIALS"):
+        print("[TRACKER] ⚠️ FIREBASE_CREDENTIALS yok, tracker başlatılmıyor")
+        return
+    _init_firebase()
+    if _firebase_db is None:
+        print(f"[TRACKER] ⚠️ Firebase başlamadı: {_firebase_init_error}")
+        return
+
+    t = threading.Thread(target=_tracker_loop, daemon=True, name="tracker")
+    t.start()
+    _tracker_thread_started = True
+    _tg_notify("🤖 KriptoAI Tracker başlatıldı (7/24 mod)")
+
+# ── ENDPOINTS — frontend için ─────────────────────────────────────────────────
+@app.get("/api/tracker/status")
+def tracker_status():
+    """Tracker durumu — uptime, son tarama, hatalar."""
+    state = dict(_tracker_state)
+    if state["started_at"]:
+        state["uptime_seconds"] = int(time.time()) - state["started_at"]
+    state["firebase_ok"] = _firebase_db is not None
+    state["firebase_error"] = _firebase_init_error
+    state["telegram_configured"] = bool(TG_TOKEN and TG_CHAT_ID)
+    return state
+
+@app.get("/api/tracker/signals")
+def tracker_signals():
+    """Tüm sinyal geçmişi — frontend bunu okuyup gösterir."""
+    signals = _fb_get_signals()
+    return {
+        "success":   True,
+        "signals":   signals,
+        "total":     len(signals),
+        "pending":   sum(1 for s in signals if not s.get("verified")),
+        "verified":  sum(1 for s in signals if s.get("verified")),
+        "wins":      sum(1 for s in signals if s.get("verified") and s.get("success")),
+        "losses":    sum(1 for s in signals if s.get("verified") and not s.get("success")),
+    }
+
+@app.get("/api/tracker/stats")
+def tracker_stats():
+    """Win rate ve skor bandı analizi."""
+    signals = _fb_get_signals()
+    verified = [s for s in signals if s.get("verified")]
+    wins = [s for s in verified if s.get("success")]
+    losses = [s for s in verified if not s.get("success")]
+
+    def avg(lst, key):
+        if not lst: return 0
+        return round(sum(s.get(key, 0) for s in lst) / len(lst), 2)
+
+    # Skor bandı
+    bands = {
+        "GÜÇLÜ AL (≥80)":  [s for s in verified if s.get("score", 0) >= 80],
+        "AL (68-79)":       [s for s in verified if 68 <= s.get("score", 0) < 80],
+        "DİKKATLİ AL":     [s for s in verified if 55 <= s.get("score", 0) < 68],
+    }
+    band_stats = {}
+    for name, band in bands.items():
+        if not band:
+            band_stats[name] = {"count": 0, "win_rate": 0, "avg_change": 0}
+        else:
+            won = sum(1 for s in band if s.get("success"))
+            band_stats[name] = {
+                "count":       len(band),
+                "win_rate":    round(100 * won / len(band), 1),
+                "avg_change":  avg(band, "change"),
+            }
+
+    return {
+        "success":      True,
+        "total":        len(signals),
+        "verified":     len(verified),
+        "pending":      len(signals) - len(verified),
+        "win_rate":     round(100 * len(wins) / len(verified), 1) if verified else 0,
+        "avg_win":      avg(wins, "change"),
+        "avg_loss":     avg(losses, "change"),
+        "total_pnl":    avg(verified, "change"),
+        "bands":        band_stats,
+    }
+
+@app.post("/api/tracker/clear")
+def tracker_clear():
+    """TÜM sinyal geçmişini siler. Test/sıfırlama için."""
+    if _fb_set_signals([]):
+        return {"success": True, "message": "Tüm geçmiş silindi"}
+    return {"success": False, "error": "Firebase yazma başarısız"}
+
+@app.post("/api/tracker/clear-pending")
+def tracker_clear_pending():
+    """Sadece bekleyen sinyalleri siler, doğrulanmışları korur."""
+    signals = _fb_get_signals()
+    verified = [s for s in signals if s.get("verified")]
+    if _fb_set_signals(verified):
+        return {
+            "success": True,
+            "kept": len(verified),
+            "removed": len(signals) - len(verified),
+        }
+    return {"success": False, "error": "Firebase yazma başarısız"}
+
+# Manuel tarama tetikleme (test için)
+@app.post("/api/tracker/scan")
+def tracker_force_scan():
+    """Hemen tarama yap (5dk beklemeden). Test için."""
+    threading.Thread(target=_scan_for_signals, daemon=True).start()
+    return {"success": True, "message": "Tarama başlatıldı"}
+
+@app.post("/api/tracker/check-exits")
+def tracker_force_exits():
+    """Hemen exit kontrolü yap. Test için."""
+    threading.Thread(target=_check_exits, daemon=True).start()
+    return {"success": True, "message": "Exit kontrolü başlatıldı"}
