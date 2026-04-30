@@ -2575,8 +2575,8 @@ def _tracker_loop():
     _tracker_state["started_at"] = int(time.time())
 
     last_scan = 0
-    SCAN_INTERVAL = 300       # 5 dakika
-    EXIT_INTERVAL = 30        # 30 saniye
+    SCAN_INTERVAL = 900       # 15 dakika (1h mum yapısına uygun)
+    EXIT_INTERVAL = 30        # 30 saniye (fiyat anlık değişimi yakalar)
 
     while True:
         try:
