@@ -2340,12 +2340,18 @@ def _log_error(prefix, err):
 
 # ── Skor hesaplama yardımcıları ──────────────────────────────────────────────
 def _exit_params(score):
-    """Skor bandına göre SL/TP/MaxHours."""
+    """Skor bandına göre SL/TP/MaxHours.
+    Önceki versiyon: TP'lere nadiren ulaşılıyordu, çoğu trade TIME ile kapanıyordu.
+    Yeni: TP1 daha yakın (sık kâr al), SL daha sıkı (küçük kayıplar), max time kısalt.
+    """
     if score >= 75:
-        return {"sl": -4.0, "tp1": 8.0, "tp2": 15.0, "max_hours": 96}
-    if score >= 65:
-        return {"sl": -3.5, "tp1": 6.0, "tp2": 12.0, "max_hours": 72}
-    return {"sl": -3.0, "tp1": 5.0, "tp2": 10.0, "max_hours": 48}
+        # Güçlü sinyal: biraz geniş hedef, ama hala makul
+        return {"sl": -3.0, "tp1": 5.0, "tp2": 10.0, "max_hours": 48}
+    if score >= 70:
+        # Orta-güçlü: sıkı yönetim, hızlı kâr al
+        return {"sl": -2.5, "tp1": 4.0, "tp2": 8.0, "max_hours": 36}
+    # 68-70 zaten girmemeli (eşik 70'e çıkarıldı), ama güvenlik için
+    return {"sl": -2.0, "tp1": 3.0, "tp2": 6.0, "max_hours": 24}
 
 def _get_current_prices():
     """Tüm Binance USDT pair'lerinin son fiyatını getir."""
@@ -2478,7 +2484,10 @@ def _scan_for_signals():
         # Mevcut sinyalleri çek
         existing = _fb_get_signals()
         now_ms = int(time.time() * 1000)
-        cooldown_ms = 24 * 60 * 60 * 1000
+        # Cooldown: aynı coin için 72 saat (3 gün) bekle
+        # Sebep: Bir trade tipik olarak 48-96 saat tutuluyor, açık trade varken
+        # yeni AL eklemek mantıksız. 24 saat çok kısaydı, spam üretiyordu.
+        cooldown_ms = 72 * 60 * 60 * 1000
 
         # Her sembol için son sinyal zamanı (verified+pending fark etmez)
         last_by_sym = {}
@@ -2504,14 +2513,17 @@ def _scan_for_signals():
         added = 0
         skipped_cooldown = 0
         new_signals_summary = []
+        cooldown_debug = []  # debug için
         prices = _get_current_prices()
 
         for sym in SCAN_SYMBOLS:
             try:
                 # Cooldown kontrolü
                 last_ts = last_by_sym.get(sym, 0)
-                if now_ms - last_ts < cooldown_ms:
+                if last_ts > 0 and now_ms - last_ts < cooldown_ms:
                     skipped_cooldown += 1
+                    hours_since = (now_ms - last_ts) / (60 * 60 * 1000)
+                    cooldown_debug.append(f"{sym}({hours_since:.0f}h)")
                     continue
 
                 # Skoru hesapla
@@ -2528,7 +2540,9 @@ def _scan_for_signals():
                     continue
 
                 score = result.get("score", 0)
-                if score < 68:
+                # Skor eşiği: 68 → 70 (kaliteyi artırmak için yükseltildi)
+                # Gerekçe: 68'de win rate %50 (rastgele), 70+ daha seçici olmalı
+                if score < 70:
                     continue
 
                 price = prices.get(sym)
@@ -2724,3 +2738,9 @@ def tracker_force_exits():
     """Hemen exit kontrolü yap. Test için."""
     threading.Thread(target=_check_exits, daemon=True).start()
     return {"success": True, "message": "Exit kontrolü başlatıldı"}
+
+@app.post("/api/tracker/clear-errors")
+def tracker_clear_errors():
+    """Errors listesini temizle (eski Render restart hatalarını sil)."""
+    _tracker_state["errors"] = []
+    return {"success": True, "message": "Errors temizlendi"}
