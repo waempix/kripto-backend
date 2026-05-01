@@ -2338,20 +2338,270 @@ def _log_error(prefix, err):
     _tracker_state["errors"].append(msg)
     _tracker_state["errors"] = _tracker_state["errors"][-20:]
 
+# ── A-Plan İyileştirmeleri ────────────────────────────────────────────────────
+# Bu bölüm Faz A iyileştirmeleri (no paid services, edge testing).
+# Win rate %45.6'dan %55+'a çıkarmak için 5 katmanlı filtre.
+
+# Cache'ler — gereksiz API çağrısını engellemek için
+_btc_trend_cache = {"data": None, "ts": 0}
+_market_state_cache = {"data": None, "ts": 0}
+
+def _get_btc_trend():
+    """BTC'nin son 4 saat ve 24 saat trendini analiz eder.
+    
+    Mantık: Altcoin'lerin %70-80'i BTC ile yüksek korelasyon. BTC düşerken
+    altcoin AL sinyali vermek istatistiksel olarak yanlış.
+    
+    Returns:
+        {
+            "trend_4h": "up"/"down"/"neutral",
+            "trend_24h": "up"/"down"/"neutral",
+            "trend_4h_pct": float,
+            "trend_24h_pct": float,
+            "score_modifier": int  # AL skoruna ekle/çıkar
+        }
+    """
+    now = time.time()
+    # 5 dakika cache (BTC her saniye değişmez)
+    if _btc_trend_cache["data"] and (now - _btc_trend_cache["ts"]) < 300:
+        return _btc_trend_cache["data"]
+    
+    try:
+        # 1h mum, son 24 mum (24 saat)
+        klines = get_pub("/api/v3/klines", {"symbol": "BTCUSDT", "interval": "1h", "limit": 25})
+        if len(klines) < 24:
+            return {"trend_4h": "neutral", "trend_24h": "neutral", "trend_4h_pct": 0, "trend_24h_pct": 0, "score_modifier": 0}
+        
+        closes = [float(k[4]) for k in klines]
+        current = closes[-1]
+        price_4h_ago = closes[-5]    # 4 saat önce
+        price_24h_ago = closes[-25]  # 24 saat önce
+        
+        pct_4h = ((current - price_4h_ago) / price_4h_ago) * 100
+        pct_24h = ((current - price_24h_ago) / price_24h_ago) * 100
+        
+        # Trend sınıflandırması
+        def classify(pct, threshold):
+            if pct > threshold: return "up"
+            if pct < -threshold: return "down"
+            return "neutral"
+        
+        trend_4h = classify(pct_4h, 1.0)    # ±1% eşik
+        trend_24h = classify(pct_24h, 2.0)  # ±2% eşik
+        
+        # Skor modifikatörü — AL skoruna eklenir
+        # Pozitif BTC trend = altcoin AL sinyaline güven artar
+        # Negatif BTC trend = altcoin AL sinyaline güven azalır (büyük ceza)
+        modifier = 0
+        if trend_24h == "up" and trend_4h == "up":
+            modifier = +8   # Güçlü pozitif trend
+        elif trend_24h == "up" and trend_4h == "neutral":
+            modifier = +4
+        elif trend_24h == "down" and trend_4h == "down":
+            modifier = -20  # Güçlü negatif trend, altcoin AL'ı iptal et
+        elif trend_24h == "down" and trend_4h == "neutral":
+            modifier = -10
+        elif trend_4h == "down":
+            modifier = -8   # Kısa vadede negatif
+        # Diğer kombinasyonlar nötr (0)
+        
+        result = {
+            "trend_4h": trend_4h,
+            "trend_24h": trend_24h,
+            "trend_4h_pct": round(pct_4h, 2),
+            "trend_24h_pct": round(pct_24h, 2),
+            "score_modifier": modifier,
+        }
+        _btc_trend_cache["data"] = result
+        _btc_trend_cache["ts"] = now
+        return result
+    except Exception as e:
+        print(f"[TRACKER] BTC trend hatası: {e}")
+        return {"trend_4h": "neutral", "trend_24h": "neutral", "trend_4h_pct": 0, "trend_24h_pct": 0, "score_modifier": 0}
+
+
+def _check_multi_timeframe(symbol):
+    """Coin'in 1d ve 4h trendini kontrol eder.
+    
+    Mantık: 1h sinyali iyi olabilir ama daha büyük zaman dilimleri aşağıysa
+    fakeout olasılığı yüksek. 1d trend yukarı, 4h trend yukarı/nötr ise
+    sinyal güvenilir.
+    
+    Returns:
+        {
+            "passes": bool,           # Filtreden geçti mi
+            "score_modifier": int,    # Skoru kaç puan etkilemeli
+            "reason": str             # Neden geçti/geçmedi
+        }
+    """
+    try:
+        # 4 saatlik mum, son 14 mum (~2.3 gün)
+        klines_4h = get_pub("/api/v3/klines", {"symbol": symbol + "USDT", "interval": "4h", "limit": 14})
+        if len(klines_4h) < 14:
+            return {"passes": True, "score_modifier": 0, "reason": "4h veri yetersiz, atla"}
+        
+        # 1 günlük mum, son 7 mum (1 hafta)
+        klines_1d = get_pub("/api/v3/klines", {"symbol": symbol + "USDT", "interval": "1d", "limit": 7})
+        if len(klines_1d) < 5:
+            return {"passes": True, "score_modifier": 0, "reason": "1d veri yetersiz, atla"}
+        
+        # 4h trend: son 12 mum (2 gün) eğimi
+        closes_4h = [float(k[4]) for k in klines_4h]
+        avg_first_half_4h = sum(closes_4h[:7]) / 7
+        avg_second_half_4h = sum(closes_4h[7:]) / 7
+        trend_4h_pct = ((avg_second_half_4h - avg_first_half_4h) / avg_first_half_4h) * 100
+        
+        # 1d trend: son 5 mum (5 gün) eğimi
+        closes_1d = [float(k[4]) for k in klines_1d[-5:]]
+        avg_first_half_1d = sum(closes_1d[:2]) / 2
+        avg_second_half_1d = sum(closes_1d[3:]) / 2
+        trend_1d_pct = ((avg_second_half_1d - avg_first_half_1d) / avg_first_half_1d) * 100
+        
+        # Karar matrisi
+        # 1d güçlü düşüş → AL'ı reddet (büyük ceza)
+        if trend_1d_pct < -8:
+            return {"passes": False, "score_modifier": -25, "reason": f"1d düşüş -{abs(trend_1d_pct):.1f}%"}
+        # 1d düşüş + 4h düşüş → reddet
+        if trend_1d_pct < -3 and trend_4h_pct < -2:
+            return {"passes": False, "score_modifier": -15, "reason": f"1d ve 4h düşüş trendinde"}
+        # 1d yatay/yukarı + 4h yatay/yukarı → güzel
+        if trend_1d_pct > -1 and trend_4h_pct > -1:
+            modifier = 0
+            if trend_1d_pct > 3 and trend_4h_pct > 2:
+                modifier = +6  # Güçlü uyumlu trend
+            elif trend_1d_pct > 1:
+                modifier = +3
+            return {"passes": True, "score_modifier": modifier, "reason": f"1d {trend_1d_pct:+.1f}%, 4h {trend_4h_pct:+.1f}%"}
+        # Karışık
+        return {"passes": True, "score_modifier": -3, "reason": "Trend karışık"}
+    except Exception as e:
+        # Hata varsa sinyali geçir (false rejection olmasın)
+        return {"passes": True, "score_modifier": 0, "reason": f"hata: {str(e)[:30]}"}
+
+
+def _check_volume_spike(symbol):
+    """Hacim spike kontrolü yapar.
+    
+    Mantık: Bir hareket "gerçek" olmak için hacim onayı şart.
+    Son 1 saat hacmi, önceki 24 saat ortalamasının 1.5x üstündeyse onaylar.
+    
+    Returns:
+        {
+            "passes": bool,
+            "score_modifier": int,
+            "ratio": float,      # Hacim oranı
+            "reason": str
+        }
+    """
+    try:
+        klines = get_pub("/api/v3/klines", {"symbol": symbol + "USDT", "interval": "1h", "limit": 25})
+        if len(klines) < 24:
+            return {"passes": True, "score_modifier": 0, "ratio": 1.0, "reason": "veri yetersiz"}
+        
+        # Volume = klines[7] (quote asset volume = USDT cinsinden)
+        volumes = [float(k[7]) for k in klines]
+        current_vol = volumes[-1]
+        avg_24h = sum(volumes[:-1]) / 24
+        
+        if avg_24h <= 0:
+            return {"passes": True, "score_modifier": 0, "ratio": 1.0, "reason": "ortalama 0"}
+        
+        ratio = current_vol / avg_24h
+        
+        # Karar
+        if ratio >= 2.5:
+            return {"passes": True, "score_modifier": +8, "ratio": ratio, "reason": f"hacim {ratio:.1f}x (güçlü)"}
+        if ratio >= 1.5:
+            return {"passes": True, "score_modifier": +4, "ratio": ratio, "reason": f"hacim {ratio:.1f}x"}
+        if ratio >= 1.0:
+            return {"passes": True, "score_modifier": 0, "ratio": ratio, "reason": "hacim normal"}
+        if ratio >= 0.6:
+            return {"passes": True, "score_modifier": -3, "ratio": ratio, "reason": "hacim düşük"}
+        # Çok düşük hacim = boş hareket
+        return {"passes": False, "score_modifier": -10, "ratio": ratio, "reason": f"hacim {ratio:.2f}x (boş hareket)"}
+    except Exception as e:
+        return {"passes": True, "score_modifier": 0, "ratio": 1.0, "reason": f"hata: {str(e)[:30]}"}
+
+
+def _check_liquidity(symbol):
+    """24h hacim filtresi — düşük likiditeli coinleri eler.
+    
+    Düşük likidite = slippage riski + manipülasyona açık.
+    """
+    try:
+        ticker = get_pub("/api/v3/ticker/24hr", {"symbol": symbol + "USDT"})
+        quote_volume = float(ticker.get("quoteVolume", 0))
+        # USDT cinsinden 24h hacim
+        if quote_volume < 10_000_000:  # $10M altı reddet
+            return {"passes": False, "reason": f"24h hacim ${quote_volume/1e6:.1f}M (düşük likidite)"}
+        if quote_volume < 50_000_000:  # $10-50M arası uyarı
+            return {"passes": True, "score_modifier": -2, "reason": f"24h ${quote_volume/1e6:.0f}M"}
+        return {"passes": True, "score_modifier": 0, "reason": f"24h ${quote_volume/1e6:.0f}M"}
+    except:
+        return {"passes": True, "score_modifier": 0, "reason": "likidite kontrolü hatası"}
+
+
+# Kategori bazlı parametreler — her coin grubu farklı volatiliteye sahip
+COIN_CATEGORIES = {
+    # BTC ve ETH — düşük volatilite
+    "BTC":    "major",
+    "ETH":    "major",
+    # Major altcoinler — orta volatilite
+    "BNB":    "major", "SOL": "major", "XRP": "major",
+    # Layer 1/2 — orta-yüksek volatilite
+    "AVAX":   "altcoin", "NEAR": "altcoin", "SUI": "altcoin", "INJ": "altcoin",
+    "APT":    "altcoin", "ARB": "altcoin", "OP": "altcoin", "STRK": "altcoin", "POL": "altcoin",
+    # DeFi — orta-yüksek
+    "LINK":   "altcoin", "AAVE": "altcoin", "PENDLE": "altcoin", "JUP": "altcoin", "UNI": "altcoin",
+    # AI — yüksek volatilite
+    "TAO":    "ai", "RENDER": "ai", "FET": "ai", "WLD": "ai",
+    # Gaming/Other
+    "IMX":    "altcoin",
+    # Memecoin — çok yüksek volatilite
+    "DOGE":   "meme", "PEPE": "meme", "BONK": "meme", "SHIB": "meme",
+}
+
+
+def _category_exit_params(symbol, score):
+    """Kategori bazlı SL/TP/MaxHours.
+    
+    Memecoin'in volatilitesi BTC'nin 5 katı, aynı parametreler işe yaramaz.
+    """
+    category = COIN_CATEGORIES.get(symbol, "altcoin")
+    
+    if category == "major":
+        # BTC, ETH: Düşük volatilite, sıkı yönetim
+        if score >= 75:
+            return {"sl": -2.0, "tp1": 3.5, "tp2": 7.0, "max_hours": 36}
+        return {"sl": -1.5, "tp1": 2.5, "tp2": 5.0, "max_hours": 24}
+    
+    elif category == "altcoin":
+        # Layer 1/2/DeFi: Orta volatilite
+        if score >= 75:
+            return {"sl": -3.0, "tp1": 5.0, "tp2": 10.0, "max_hours": 48}
+        return {"sl": -2.5, "tp1": 4.0, "tp2": 8.0, "max_hours": 36}
+    
+    elif category == "ai":
+        # AI coinleri: Yüksek volatilite, momentum
+        if score >= 75:
+            return {"sl": -4.0, "tp1": 7.0, "tp2": 14.0, "max_hours": 48}
+        return {"sl": -3.5, "tp1": 5.5, "tp2": 11.0, "max_hours": 36}
+    
+    elif category == "meme":
+        # Memecoinler: Çok yüksek volatilite, geniş hedef
+        if score >= 75:
+            return {"sl": -6.0, "tp1": 12.0, "tp2": 25.0, "max_hours": 48}
+        return {"sl": -5.0, "tp1": 9.0, "tp2": 18.0, "max_hours": 36}
+    
+    # Default
+    return {"sl": -2.5, "tp1": 4.0, "tp2": 8.0, "max_hours": 36}
+
+
 # ── Skor hesaplama yardımcıları ──────────────────────────────────────────────
 def _exit_params(score):
-    """Skor bandına göre SL/TP/MaxHours.
-    Önceki versiyon: TP'lere nadiren ulaşılıyordu, çoğu trade TIME ile kapanıyordu.
-    Yeni: TP1 daha yakın (sık kâr al), SL daha sıkı (küçük kayıplar), max time kısalt.
-    """
-    if score >= 75:
-        # Güçlü sinyal: biraz geniş hedef, ama hala makul
-        return {"sl": -3.0, "tp1": 5.0, "tp2": 10.0, "max_hours": 48}
-    if score >= 70:
-        # Orta-güçlü: sıkı yönetim, hızlı kâr al
-        return {"sl": -2.5, "tp1": 4.0, "tp2": 8.0, "max_hours": 36}
-    # 68-70 zaten girmemeli (eşik 70'e çıkarıldı), ama güvenlik için
-    return {"sl": -2.0, "tp1": 3.0, "tp2": 6.0, "max_hours": 24}
+    """Eski exit fonksiyonu — geri uyumluluk için bırakıldı.
+    Yeni kod _category_exit_params kullanmalı."""
+    return {"sl": -2.5, "tp1": 4.0, "tp2": 8.0, "max_hours": 36}
 
 def _get_current_prices():
     """Tüm Binance USDT pair'lerinin son fiyatını getir."""
@@ -2417,7 +2667,8 @@ def _check_exits():
                 continue
 
             pct = ((cur - entry) / entry) * 100
-            params = _exit_params(h.get("score", 68))
+            # Kategori bazlı exit parametreleri (memecoin ≠ BTC)
+            params = _category_exit_params(sym, h.get("score", 70))
 
             # Trailing stop için zirve takibi
             peak = h.get("peakPrice", 0)
@@ -2541,7 +2792,6 @@ def _scan_for_signals():
 
                 score = result.get("score", 0)
                 # Skor eşiği: 68 → 70 (kaliteyi artırmak için yükseltildi)
-                # Gerekçe: 68'de win rate %50 (rastgele), 70+ daha seçici olmalı
                 if score < 70:
                     continue
 
@@ -2549,28 +2799,93 @@ def _scan_for_signals():
                 if not price or price <= 0:
                     continue
 
-                # Yeni sinyal ekle
+                # ════════════════════════════════════════════════════════════════
+                #          A-PLAN FİLTRELERİ — kaliteyi artırma katmanı
+                # ════════════════════════════════════════════════════════════════
+                # Bu 4 filtre skor 70+ olan sinyalleri **ek doğrulama**dan geçirir.
+                # Her filtrenin score_modifier'ı toplam skoru etkiler.
+                # Eğer toplam adjusted_score 70 altına düşerse sinyal iptal.
+                
+                filter_modifier = 0
+                filter_reasons = []
+                
+                # ── Filtre 1: BTC Korelasyon ──
+                # Altcoin'lerin %70-80'i BTC ile korelasyon gösterir.
+                # BTC düşüyorsa altcoin AL sinyali genelde fakeout olur.
+                btc_trend = _get_btc_trend()
+                filter_modifier += btc_trend["score_modifier"]
+                if btc_trend["score_modifier"] != 0:
+                    filter_reasons.append(f"BTC {btc_trend['trend_24h']}({btc_trend['score_modifier']:+d})")
+                
+                # ── Filtre 2: Multi-timeframe Trend Onayı ──
+                # 1d ve 4h trendler aşağıysa sinyal iptal (fakeout koruması).
+                # BTC için bu filtre uygulanmaz (BTC zaten BTC trendine göre değil).
+                if sym != "BTC":
+                    mtf = _check_multi_timeframe(sym)
+                    filter_modifier += mtf["score_modifier"]
+                    if not mtf["passes"]:
+                        # 1d trendi çok kötüyse direkt reddet
+                        skipped_cooldown += 0  # sayma, direkt geç
+                        print(f"[TRACKER] ❌ {sym} reddedildi: {mtf['reason']}")
+                        continue
+                    if mtf["score_modifier"] != 0:
+                        filter_reasons.append(f"MTF({mtf['score_modifier']:+d})")
+                
+                # ── Filtre 3: Volume Spike ──
+                # Hareket gerçek mi yoksa boş mu? Volume onayı şart.
+                vol_check = _check_volume_spike(sym)
+                filter_modifier += vol_check["score_modifier"]
+                if not vol_check["passes"]:
+                    print(f"[TRACKER] ❌ {sym} reddedildi: {vol_check['reason']}")
+                    continue
+                if vol_check["score_modifier"] != 0:
+                    filter_reasons.append(f"Vol{vol_check['ratio']:.1f}x({vol_check['score_modifier']:+d})")
+                
+                # ── Filtre 4: Likidite ──
+                # Düşük likidite = slippage + manipülasyon riski.
+                liq_check = _check_liquidity(sym)
+                if not liq_check["passes"]:
+                    print(f"[TRACKER] ❌ {sym} reddedildi: {liq_check['reason']}")
+                    continue
+                filter_modifier += liq_check.get("score_modifier", 0)
+                
+                # ── Final Skor Kontrolü ──
+                adjusted_score = score + filter_modifier
+                if adjusted_score < 70:
+                    print(f"[TRACKER] ⚠️ {sym} skor {score}→{adjusted_score} filter sonrası 70 altı, reddedildi ({', '.join(filter_reasons)})")
+                    continue
+                
+                # ════════════════════════════════════════════════════════════════
+                
+                # Yeni sinyal ekle (adjusted_score ile)
                 new_sig = {
-                    "sym":       sym,
-                    "score":     score,
-                    "techScore": result.get("tech_score", score),
-                    "signal":    result.get("rec", "AL"),
-                    "entry":     price,
-                    "ts":        now_ms,
-                    "verified":  False,
+                    "sym":          sym,
+                    "score":        adjusted_score,    # A-Plan ayarlanmış skor
+                    "rawScore":     score,              # Orijinal teknik skor
+                    "techScore":    result.get("tech_score", score),
+                    "signal":       result.get("rec", "AL"),
+                    "entry":        price,
+                    "ts":           now_ms,
+                    "verified":     False,
+                    "filters":      filter_reasons,    # Hangi filtreler etkiledi
+                    "btcTrend":     btc_trend["trend_24h"],
+                    "category":     COIN_CATEGORIES.get(sym, "altcoin"),
                 }
                 existing.append(new_sig)
                 last_by_sym[sym] = now_ms
                 added += 1
-                new_signals_summary.append(f"{sym}({score})")
+                new_signals_summary.append(f"{sym}({adjusted_score})")
 
-                # Telegram bildirimi
+                # Telegram bildirimi (A-Plan detaylı)
                 _tg_notify(
                     f"🔔 <b>YENİ AL SİNYALİ</b>\n"
-                    f"<b>{sym}</b> · Skor: {score}\n"
+                    f"<b>{sym}</b> · Kategori: {COIN_CATEGORIES.get(sym, 'altcoin')}\n"
+                    f"Skor: {adjusted_score} (raw {score})\n"
                     f"Giriş: <b>${price:.6g}</b>\n"
                     f"RSI: {result.get('rsi', '—')} · "
                     f"MACD: {'🟢' if result.get('macd', 0) == 1 else '🔴'}\n"
+                    f"BTC trend: {btc_trend['trend_24h']} ({btc_trend['trend_24h_pct']:+.1f}%)\n"
+                    f"Filtreler: {', '.join(filter_reasons) if filter_reasons else 'temiz'}\n"
                     f"Sebep: {', '.join(result.get('reasons', [])[:3])}"
                 )
             except Exception as e:
@@ -2744,3 +3059,58 @@ def tracker_clear_errors():
     """Errors listesini temizle (eski Render restart hatalarını sil)."""
     _tracker_state["errors"] = []
     return {"success": True, "message": "Errors temizlendi"}
+
+@app.get("/api/tracker/btc-trend")
+def tracker_btc_trend():
+    """A-Plan: BTC trend bilgisi. AL sinyallerini etkileyen ana filtre."""
+    return _get_btc_trend()
+
+@app.get("/api/tracker/filter-test/{symbol}")
+def tracker_filter_test(symbol: str):
+    """A-Plan: Belirli bir coin için tüm filtreleri test eder (debug için).
+    Sinyal alıp almayacağını gösterir."""
+    sym = symbol.upper()
+    try:
+        # Skor
+        result = compute_smart_score(sym)
+        score = result.get("score", 0) if result else 0
+        
+        # BTC trend
+        btc = _get_btc_trend()
+        
+        # MTF
+        mtf = _check_multi_timeframe(sym) if sym != "BTC" else {"passes": True, "score_modifier": 0, "reason": "BTC kendisi"}
+        
+        # Volume
+        vol = _check_volume_spike(sym)
+        
+        # Likidite
+        liq = _check_liquidity(sym)
+        
+        adjusted = score + btc["score_modifier"] + mtf["score_modifier"] + vol["score_modifier"] + liq.get("score_modifier", 0)
+        
+        would_pass = (
+            score >= 70
+            and mtf["passes"]
+            and vol["passes"]
+            and liq["passes"]
+            and adjusted >= 70
+        )
+        
+        return {
+            "success":           True,
+            "symbol":            sym,
+            "category":          COIN_CATEGORIES.get(sym, "altcoin"),
+            "raw_score":         score,
+            "adjusted_score":    adjusted,
+            "would_signal":      would_pass,
+            "filters": {
+                "btc_trend":     btc,
+                "multi_timeframe": mtf,
+                "volume":        vol,
+                "liquidity":     liq,
+            },
+            "exit_params": _category_exit_params(sym, adjusted),
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
