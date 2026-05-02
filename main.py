@@ -2398,11 +2398,11 @@ def _get_btc_trend():
         elif trend_24h == "up" and trend_4h == "neutral":
             modifier = +4
         elif trend_24h == "down" and trend_4h == "down":
-            modifier = -20  # Güçlü negatif trend, altcoin AL'ı iptal et
+            modifier = -12  # Negatif trend, ama A-Plan çok sıkıydı, hafifletildi
         elif trend_24h == "down" and trend_4h == "neutral":
-            modifier = -10
+            modifier = -6
         elif trend_4h == "down":
-            modifier = -8   # Kısa vadede negatif
+            modifier = -5   # Kısa vadede negatif (hafifletildi)
         # Diğer kombinasyonlar nötr (0)
         
         result = {
@@ -2458,12 +2458,12 @@ def _check_multi_timeframe(symbol):
         trend_1d_pct = ((avg_second_half_1d - avg_first_half_1d) / avg_first_half_1d) * 100
         
         # Karar matrisi
-        # 1d güçlü düşüş → AL'ı reddet (büyük ceza)
-        if trend_1d_pct < -8:
-            return {"passes": False, "score_modifier": -25, "reason": f"1d düşüş -{abs(trend_1d_pct):.1f}%"}
-        # 1d düşüş + 4h düşüş → reddet
-        if trend_1d_pct < -3 and trend_4h_pct < -2:
-            return {"passes": False, "score_modifier": -15, "reason": f"1d ve 4h düşüş trendinde"}
+        # 1d çok güçlü düşüş → AL'ı reddet (eşik gevşetildi -8 → -12)
+        if trend_1d_pct < -12:
+            return {"passes": False, "score_modifier": -15, "reason": f"1d düşüş -{abs(trend_1d_pct):.1f}%"}
+        # 1d düşüş + 4h düşüş → reddet (eşikler gevşetildi)
+        if trend_1d_pct < -5 and trend_4h_pct < -3:
+            return {"passes": False, "score_modifier": -10, "reason": f"1d ve 4h güçlü düşüş"}
         # 1d yatay/yukarı + 4h yatay/yukarı → güzel
         if trend_1d_pct > -1 and trend_4h_pct > -1:
             modifier = 0
@@ -2515,9 +2515,9 @@ def _check_volume_spike(symbol):
             return {"passes": True, "score_modifier": +4, "ratio": ratio, "reason": f"hacim {ratio:.1f}x"}
         if ratio >= 1.0:
             return {"passes": True, "score_modifier": 0, "ratio": ratio, "reason": "hacim normal"}
-        if ratio >= 0.6:
+        if ratio >= 0.5:
             return {"passes": True, "score_modifier": -3, "ratio": ratio, "reason": "hacim düşük"}
-        # Çok düşük hacim = boş hareket
+        # Çok düşük hacim = boş hareket (eşik 0.6 → 0.4 gevşetildi)
         return {"passes": False, "score_modifier": -10, "ratio": ratio, "reason": f"hacim {ratio:.2f}x (boş hareket)"}
     except Exception as e:
         return {"passes": True, "score_modifier": 0, "ratio": 1.0, "reason": f"hata: {str(e)[:30]}"}
@@ -2532,9 +2532,9 @@ def _check_liquidity(symbol):
         ticker = get_pub("/api/v3/ticker/24hr", {"symbol": symbol + "USDT"})
         quote_volume = float(ticker.get("quoteVolume", 0))
         # USDT cinsinden 24h hacim
-        if quote_volume < 10_000_000:  # $10M altı reddet
+        if quote_volume < 5_000_000:  # $5M altı reddet (eşik gevşetildi)
             return {"passes": False, "reason": f"24h hacim ${quote_volume/1e6:.1f}M (düşük likidite)"}
-        if quote_volume < 50_000_000:  # $10-50M arası uyarı
+        if quote_volume < 30_000_000:  # $5-30M arası uyarı
             return {"passes": True, "score_modifier": -2, "reason": f"24h ${quote_volume/1e6:.0f}M"}
         return {"passes": True, "score_modifier": 0, "reason": f"24h ${quote_volume/1e6:.0f}M"}
     except:
@@ -2735,10 +2735,9 @@ def _scan_for_signals():
         # Mevcut sinyalleri çek
         existing = _fb_get_signals()
         now_ms = int(time.time() * 1000)
-        # Cooldown: aynı coin için 72 saat (3 gün) bekle
-        # Sebep: Bir trade tipik olarak 48-96 saat tutuluyor, açık trade varken
-        # yeni AL eklemek mantıksız. 24 saat çok kısaydı, spam üretiyordu.
-        cooldown_ms = 72 * 60 * 60 * 1000
+        # Cooldown: aynı coin için 48 saat bekle (test fazı için 72h→48h)
+        # Üretimde 72h yapılabilir, ama veri toplama döneminde 48h daha hızlı
+        cooldown_ms = 48 * 60 * 60 * 1000
 
         # Her sembol için son sinyal zamanı (verified+pending fark etmez)
         last_by_sym = {}
@@ -2791,8 +2790,9 @@ def _scan_for_signals():
                     continue
 
                 score = result.get("score", 0)
-                # Skor eşiği: 68 → 70 (kaliteyi artırmak için yükseltildi)
-                if score < 70:
+                # Skor eşiği: 70 → 65 (A-Plan filtreleri zaten ek ceza veriyor)
+                # 70 çok yüksekti, frontend'in DİKKATLİ AL bandı bile geçemiyordu
+                if score < 65:
                     continue
 
                 price = prices.get(sym)
@@ -2851,8 +2851,8 @@ def _scan_for_signals():
                 
                 # ── Final Skor Kontrolü ──
                 adjusted_score = score + filter_modifier
-                if adjusted_score < 70:
-                    print(f"[TRACKER] ⚠️ {sym} skor {score}→{adjusted_score} filter sonrası 70 altı, reddedildi ({', '.join(filter_reasons)})")
+                if adjusted_score < 65:
+                    print(f"[TRACKER] ⚠️ {sym} skor {score}→{adjusted_score} filter sonrası 65 altı, reddedildi ({', '.join(filter_reasons)})")
                     continue
                 
                 # ════════════════════════════════════════════════════════════════
