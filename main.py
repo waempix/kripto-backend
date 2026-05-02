@@ -2344,7 +2344,7 @@ def _log_error(prefix, err):
 
 # Cache'ler — gereksiz API çağrısını engellemek için
 _btc_trend_cache = {"data": None, "ts": 0}
-_market_state_cache = {"data": None, "ts": 0}
+# NOT: _market_state_cache zaten yukarıda satır ~434'te tanımlı, tekrar etme!
 
 def _get_btc_trend():
     """BTC'nin son 4 saat ve 24 saat trendini analiz eder.
