@@ -2797,7 +2797,9 @@ def _scan_for_signals():
                         continue
                     raise
 
-                if not result or not result.get("success"):
+                # NOT: compute_smart_score "success" key dönmez, sadece score/signal döner.
+                # Result None ise gerçekten hata var demek.
+                if not result or "score" not in result:
                     scan_errors += 1
                     continue
 
@@ -3124,11 +3126,11 @@ def tracker_filter_test(symbol: str):
         adjusted = score + btc["score_modifier"] + mtf["score_modifier"] + vol["score_modifier"] + liq.get("score_modifier", 0)
         
         would_pass = (
-            score >= 70
+            score >= 65
             and mtf["passes"]
             and vol["passes"]
             and liq["passes"]
-            and adjusted >= 70
+            and adjusted >= 65
         )
         
         return {
