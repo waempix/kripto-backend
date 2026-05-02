@@ -2762,9 +2762,20 @@ def _scan_for_signals():
         # Direkt smart_score'u her sembol için çağıralım.
         added = 0
         skipped_cooldown = 0
+        skipped_low_score = 0      # raw_score < 65
+        skipped_no_price = 0
+        skipped_btc_filter = 0
+        skipped_mtf = 0
+        skipped_volume = 0
+        skipped_liquidity = 0
+        skipped_adjusted = 0       # filter sonrası 65 altı
+        skipped_400 = 0            # HYPE, AKT gibi
+        scan_errors = 0
         new_signals_summary = []
-        cooldown_debug = []  # debug için
+        cooldown_debug = []
         prices = _get_current_prices()
+        
+        print(f"[TRACKER] 🔍 Tarama başladı — {len(SCAN_SYMBOLS)} coin", flush=True)
 
         for sym in SCAN_SYMBOLS:
             try:
@@ -2781,22 +2792,24 @@ def _scan_for_signals():
                     result = compute_smart_score(sym)
                 except HTTPException as he:
                     # 400 = coin Binance Spot'ta yok (HYPE, AKT gibi DEX-only coinler)
-                    # Bunları sessizce atla, error log'a yazma (her 15 dakika tekrar olmasın)
                     if he.status_code == 400:
+                        skipped_400 += 1
                         continue
                     raise
 
                 if not result or not result.get("success"):
+                    scan_errors += 1
                     continue
 
                 score = result.get("score", 0)
                 # Skor eşiği: 70 → 65 (A-Plan filtreleri zaten ek ceza veriyor)
-                # 70 çok yüksekti, frontend'in DİKKATLİ AL bandı bile geçemiyordu
                 if score < 65:
+                    skipped_low_score += 1
                     continue
 
                 price = prices.get(sym)
                 if not price or price <= 0:
+                    skipped_no_price += 1
                     continue
 
                 # ════════════════════════════════════════════════════════════════
@@ -2818,41 +2831,39 @@ def _scan_for_signals():
                     filter_reasons.append(f"BTC {btc_trend['trend_24h']}({btc_trend['score_modifier']:+d})")
                 
                 # ── Filtre 2: Multi-timeframe Trend Onayı ──
-                # 1d ve 4h trendler aşağıysa sinyal iptal (fakeout koruması).
-                # BTC için bu filtre uygulanmaz (BTC zaten BTC trendine göre değil).
                 if sym != "BTC":
                     mtf = _check_multi_timeframe(sym)
                     filter_modifier += mtf["score_modifier"]
                     if not mtf["passes"]:
-                        # 1d trendi çok kötüyse direkt reddet
-                        skipped_cooldown += 0  # sayma, direkt geç
-                        print(f"[TRACKER] ❌ {sym} reddedildi: {mtf['reason']}")
+                        skipped_mtf += 1
+                        print(f"[TRACKER] ❌ {sym} reddedildi: MTF {mtf['reason']}", flush=True)
                         continue
                     if mtf["score_modifier"] != 0:
                         filter_reasons.append(f"MTF({mtf['score_modifier']:+d})")
                 
                 # ── Filtre 3: Volume Spike ──
-                # Hareket gerçek mi yoksa boş mu? Volume onayı şart.
                 vol_check = _check_volume_spike(sym)
                 filter_modifier += vol_check["score_modifier"]
                 if not vol_check["passes"]:
-                    print(f"[TRACKER] ❌ {sym} reddedildi: {vol_check['reason']}")
+                    skipped_volume += 1
+                    print(f"[TRACKER] ❌ {sym} reddedildi: {vol_check['reason']}", flush=True)
                     continue
                 if vol_check["score_modifier"] != 0:
                     filter_reasons.append(f"Vol{vol_check['ratio']:.1f}x({vol_check['score_modifier']:+d})")
                 
                 # ── Filtre 4: Likidite ──
-                # Düşük likidite = slippage + manipülasyon riski.
                 liq_check = _check_liquidity(sym)
                 if not liq_check["passes"]:
-                    print(f"[TRACKER] ❌ {sym} reddedildi: {liq_check['reason']}")
+                    skipped_liquidity += 1
+                    print(f"[TRACKER] ❌ {sym} reddedildi: {liq_check['reason']}", flush=True)
                     continue
                 filter_modifier += liq_check.get("score_modifier", 0)
                 
                 # ── Final Skor Kontrolü ──
                 adjusted_score = score + filter_modifier
                 if adjusted_score < 65:
-                    print(f"[TRACKER] ⚠️ {sym} skor {score}→{adjusted_score} filter sonrası 65 altı, reddedildi ({', '.join(filter_reasons)})")
+                    skipped_adjusted += 1
+                    print(f"[TRACKER] ⚠️ {sym} skor {score}→{adjusted_score} ({', '.join(filter_reasons)})", flush=True)
                     continue
                 
                 # ════════════════════════════════════════════════════════════════
@@ -2892,12 +2903,35 @@ def _scan_for_signals():
                 _log_error(f"Sembol {sym} taraması", e)
                 continue
 
+        # ── DAİMA ÖZET LOGU YAZ ──
+        # Hangi sebep kaç coin reddetti detaylı göster
+        summary_parts = []
+        if added > 0:
+            summary_parts.append(f"✅ {added} yeni: {', '.join(new_signals_summary)}")
+        if skipped_cooldown > 0:
+            summary_parts.append(f"⏰ {skipped_cooldown} cooldown")
+        if skipped_low_score > 0:
+            summary_parts.append(f"📉 {skipped_low_score} skor<65")
+        if skipped_btc_filter > 0:
+            summary_parts.append(f"🅱️ {skipped_btc_filter} BTC")
+        if skipped_mtf > 0:
+            summary_parts.append(f"📊 {skipped_mtf} MTF")
+        if skipped_volume > 0:
+            summary_parts.append(f"📦 {skipped_volume} volume")
+        if skipped_liquidity > 0:
+            summary_parts.append(f"💧 {skipped_liquidity} likidite")
+        if skipped_adjusted > 0:
+            summary_parts.append(f"⚠️ {skipped_adjusted} adjusted<65")
+        if skipped_400 > 0:
+            summary_parts.append(f"🚫 {skipped_400} skip(400)")
+        if scan_errors > 0:
+            summary_parts.append(f"❌ {scan_errors} error")
+        
+        print(f"[TRACKER] 📊 Tarama bitti: {' | '.join(summary_parts) if summary_parts else 'tüm coinler reddedildi'}", flush=True)
+
         if added > 0:
             _fb_set_signals(existing)
             _tracker_state["signals_added"] += added
-            print(f"[TRACKER] 📝 {added} yeni: {', '.join(new_signals_summary)} (cooldown: {skipped_cooldown})")
-        elif skipped_cooldown > 0:
-            print(f"[TRACKER] 📝 0 yeni, {skipped_cooldown} cooldown'da")
 
         _tracker_state["last_scan"] = int(time.time())
         _tracker_state["scans_done"] += 1
