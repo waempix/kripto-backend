@@ -2652,9 +2652,10 @@ def _check_exits():
             if cur is None:
                 cur = prices.get(sym + "USDT")
 
-            # Fiyat yoksa ve 96 saat geçtiyse zorla kapat
+            # Fiyat yoksa ve 48 saat geçtiyse zorla kapat (önceki 96h çok uzundu)
+            # APT, INJ gibi coinler bazen prices dict'te bulunmuyor
             if cur is None:
-                if age_h >= FORCE_CLOSE_HOURS:
+                if age_h >= 48:  # 48 saat sonra zorla kapat
                     h["exit"] = entry
                     h["change"] = 0
                     h["success"] = False
@@ -2663,7 +2664,12 @@ def _check_exits():
                     h["exitReason"] = "NO_PRICE"
                     h["holdHours"] = round(age_h)
                     changed = True
-                    exits_log.append(f"{sym} NO_PRICE")
+                    exits_log.append(f"{sym} NO_PRICE {round(age_h)}h")
+                    print(f"[TRACKER] ⚠️ {sym} fiyat alınamadı, {round(age_h)}h sonra zorla kapatıldı", flush=True)
+                else:
+                    # Henüz 48h dolmadı, log at ki bilelim
+                    if age_h >= 24:
+                        print(f"[TRACKER] ⚠️ {sym} fiyat YOK, {age_h:.1f}h bekledi (48h'da kapanır)", flush=True)
                 continue
 
             pct = ((cur - entry) / entry) * 100
