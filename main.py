@@ -2895,17 +2895,61 @@ def _scan_for_signals():
                 added += 1
                 new_signals_summary.append(f"{sym}({adjusted_score})")
 
-                # Telegram bildirimi (A-Plan detaylı)
+                # ── Telegram bildirimi — AKSİYON ODAKLI (SL/TP dahil) ──
+                # Skor 75+ → "🚨 ACİL AL" / Skor 70-74 → "🟢 AL" / Skor 65-69 → "🟡 DİKKATLİ"
+                if adjusted_score >= 75:
+                    urgency = "🚨 GÜÇLÜ AL"
+                    intensity = "🔥🔥🔥"
+                elif adjusted_score >= 70:
+                    urgency = "🟢 AL"
+                    intensity = "🔥🔥"
+                else:
+                    urgency = "🟡 DİKKATLİ AL"
+                    intensity = "🔥"
+                
+                # Kategori bazlı SL/TP (aynı _check_exits ile uyumlu)
+                exit_p = _category_exit_params(sym, adjusted_score)
+                sl_price = price * (1 + exit_p["sl"] / 100)
+                tp1_price = price * (1 + exit_p["tp1"] / 100)
+                tp2_price = price * (1 + exit_p["tp2"] / 100)
+                
+                # RSI yorumu (kullanıcı hızlı karar versin)
+                rsi_val = result.get('rsi', 50)
+                if rsi_val < 30:
+                    rsi_note = "aşırı satım — dip"
+                elif rsi_val < 50:
+                    rsi_note = "alım bölgesi"
+                elif rsi_val < 65:
+                    rsi_note = "normal"
+                elif rsi_val < 75:
+                    rsi_note = "⚠️ yüksek"
+                else:
+                    rsi_note = "🔴 aşırı alım"
+                
+                vol_ratio = result.get('vol_ratio', 1)
+                vol_note = ""
+                if vol_ratio >= 2.0:
+                    vol_note = "🔥 hacim patlaması"
+                elif vol_ratio >= 1.5:
+                    vol_note = "📈 hacim güçlü"
+                
                 _tg_notify(
-                    f"🔔 <b>YENİ AL SİNYALİ</b>\n"
-                    f"<b>{sym}</b> · Kategori: {COIN_CATEGORIES.get(sym, 'altcoin')}\n"
-                    f"Skor: {adjusted_score} (raw {score})\n"
-                    f"Giriş: <b>${price:.6g}</b>\n"
-                    f"RSI: {result.get('rsi', '—')} · "
-                    f"MACD: {'🟢' if result.get('macd', 0) == 1 else '🔴'}\n"
-                    f"BTC trend: {btc_trend['trend_24h']} ({btc_trend['trend_24h_pct']:+.1f}%)\n"
-                    f"Filtreler: {', '.join(filter_reasons) if filter_reasons else 'temiz'}\n"
-                    f"Sebep: {', '.join(result.get('reasons', [])[:3])}"
+                    f"{urgency} {intensity}\n"
+                    f"═══════════════\n"
+                    f"<b>{sym}</b> ({COIN_CATEGORIES.get(sym, 'altcoin')})\n"
+                    f"💰 Giriş:  <b>${price:.6g}</b>\n"
+                    f"🛑 SL:     ${sl_price:.6g} ({exit_p['sl']:+.1f}%)\n"
+                    f"🎯 TP1:    ${tp1_price:.6g} (+{exit_p['tp1']:.1f}%)\n"
+                    f"🎯 TP2:    ${tp2_price:.6g} (+{exit_p['tp2']:.1f}%)\n"
+                    f"⏱️ Maks:   {exit_p['max_hours']}sa\n"
+                    f"───────────────\n"
+                    f"📊 Skor: {adjusted_score} (raw {score})\n"
+                    f"📈 RSI: {rsi_val} ({rsi_note})\n"
+                    f"📉 MACD: {'🟢 alım' if result.get('macd', 0) == 1 else '🔴 satış' if result.get('macd', 0) == -1 else '⚪ nötr'}\n"
+                    f"{vol_note + chr(10) if vol_note else ''}"
+                    f"🅱️ BTC: {btc_trend['trend_24h']} ({btc_trend['trend_24h_pct']:+.1f}%)\n"
+                    f"───────────────\n"
+                    f"💡 {', '.join(result.get('reasons', [])[:2])}"
                 )
             except Exception as e:
                 _log_error(f"Sembol {sym} taraması", e)
@@ -2954,7 +2998,7 @@ def _tracker_loop():
     _tracker_state["started_at"] = int(time.time())
 
     last_scan = 0
-    SCAN_INTERVAL = 900       # 15 dakika (1h mum yapısına uygun)
+    SCAN_INTERVAL = 300       # 5 dakika (önceki 15dk - sinyaller daha hızlı gelsin)
     EXIT_INTERVAL = 30        # 30 saniye (fiyat anlık değişimi yakalar)
 
     while True:
