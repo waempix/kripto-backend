@@ -2928,6 +2928,38 @@ def _scan_for_signals():
                     continue
                 
                 # ════════════════════════════════════════════════════════════════
+                # 🛡️ FOMO TRAP PROTECTION — 6 Mayıs 2026 Performans Analizinden
+                # ════════════════════════════════════════════════════════════════
+                # GÜÇLÜ AL ≥80 → %0 isabet, -%3.35 ortalama (KAYIP!)
+                # AL 68-79    → %46 isabet, -%0.07 ortalama (sıfır)
+                # DİKKATLİ 55-67 → %71 isabet, +%1.99 ortalama (KAZANÇ!)
+                # 
+                # Yüksek skor + yüksek RSI = ZİRVE göstergesi, AL değil!
+                # Skor boostları (BTC up, hacim patlaması) zirvede oluşuyor.
+                
+                rsi_value = result.get("rsi", 50) or 50
+                bb_pos = result.get("bb_pos", 0)  # 1=zirve, -1=dip, 0=orta
+                
+                # Kural 1: Yüksek skor + Yüksek RSI = FOMO tuzağı, REDDEDİLİR
+                if adjusted_score >= 75 and rsi_value >= 65:
+                    skipped_adjusted += 1
+                    print(f"[TRACKER] 🛡️ {sym} FOMO TRAP: skor {adjusted_score} + RSI {rsi_value:.1f} (zirve riski)", flush=True)
+                    continue
+                
+                # Kural 2: Yüksek skor + BB üst bant = kesin zirve, REDDEDİLİR
+                if adjusted_score >= 75 and bb_pos == 1:
+                    skipped_adjusted += 1
+                    print(f"[TRACKER] 🛡️ {sym} ZİRVE: skor {adjusted_score} + BB üst (geri dönüş riski)", flush=True)
+                    continue
+                
+                # Kural 3: Skor 80+ (GÜÇLÜ AL) — sadece RSI<55 ile geçer
+                # Çünkü bu seviyede genelde aşırı alım gerçekleşir
+                if adjusted_score >= 80 and rsi_value >= 55:
+                    skipped_adjusted += 1
+                    print(f"[TRACKER] 🛡️ {sym} GÜÇLÜ AL ama RSI {rsi_value:.1f} yüksek, atla", flush=True)
+                    continue
+                
+                # ════════════════════════════════════════════════════════════════
                 
                 # Yeni sinyal ekle (adjusted_score ile)
                 new_sig = {
@@ -2949,16 +2981,23 @@ def _scan_for_signals():
                 new_signals_summary.append(f"{sym}({adjusted_score})")
 
                 # ── Telegram bildirimi — AKSİYON ODAKLI (SL/TP dahil) ──
-                # Skor 75+ → "🚨 ACİL AL" / Skor 70-74 → "🟢 AL" / Skor 65-69 → "🟡 DİKKATLİ"
+                # NOT: GÜÇLÜ AL artık sadece RSI<55 olduğunda geliyor (FOMO koruması)
+                # Performans verisi: 65-72 sweet spot, 75+ riskli ama RSI ile filtre
+                rsi_val = result.get('rsi', 50) or 50
                 if adjusted_score >= 75:
-                    urgency = "🚨 GÜÇLÜ AL"
+                    # RSI<55 zaten garantili (FOMO trap atladı)
+                    urgency = "🎯 KESİN AL"
                     intensity = "🔥🔥🔥"
                 elif adjusted_score >= 70:
                     urgency = "🟢 AL"
                     intensity = "🔥🔥"
-                else:
-                    urgency = "🟡 DİKKATLİ AL"
+                elif adjusted_score >= 67:
+                    urgency = "🟡 AL (orta)"
                     intensity = "🔥"
+                else:
+                    # 65-66 — sweet spot bandı (DİKKATLİ AL, performans en iyi burada)
+                    urgency = "💎 DİKKATLİ AL"
+                    intensity = "✨"
                 
                 # Kategori bazlı SL/TP (aynı _check_exits ile uyumlu)
                 exit_p = _category_exit_params(sym, adjusted_score)
