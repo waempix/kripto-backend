@@ -2330,6 +2330,8 @@ _tracker_state = {
     "signals_added":    0,
     "errors":           [],
     "started_at":       0,
+    "active_symbols":   [],   # Son taramada taranan tüm semboller (sabit + gainer)
+    "gainer_symbols":   [],   # Son taramada eklenen dinamik gainerler (24h değişimi ile)
 }
 
 def _log_error(prefix, err):
@@ -2798,6 +2800,12 @@ def _scan_for_signals():
                 gainer_candidates.sort(key=lambda x: x[1], reverse=True)
                 dynamic_gainers = [g[0] for g in gainer_candidates[:30]]
                 
+                # State'e kaydet (frontend okuyabilsin)
+                _tracker_state["gainer_symbols"] = [
+                    {"sym": g[0], "change_24h": round(g[1], 2), "volume_24h": round(g[2])}
+                    for g in gainer_candidates[:30]
+                ]
+                
                 if dynamic_gainers:
                     top5_str = ", ".join([f"{g[0]}(+{g[1]:.0f}%)" for g in gainer_candidates[:5]])
                     print(f"[TRACKER] 🚀 Top gainers: {top5_str}", flush=True)
@@ -2806,6 +2814,7 @@ def _scan_for_signals():
         
         # C) Sabit + Dinamik birleşim (duplicates kaldırılır, sıra korunur)
         SCAN_SYMBOLS = list(dict.fromkeys(STATIC_SYMBOLS + dynamic_gainers))
+        _tracker_state["active_symbols"] = SCAN_SYMBOLS
 
         # Mevcut /api/signals endpoint'ini iç olarak çağırırsak skor üretir,
         # ama kendi içinde fiyat ve indikatör çekiyor. Daha basit yol:
@@ -3189,6 +3198,26 @@ def tracker_clear_errors():
     """Errors listesini temizle (eski Render restart hatalarını sil)."""
     _tracker_state["errors"] = []
     return {"success": True, "message": "Errors temizlendi"}
+
+@app.get("/api/tracker/active-symbols")
+def tracker_active_symbols():
+    """Son taramada hangi coinler tarandı? Sabit + dinamik gainerler.
+    Frontend bu listeyi kullanarak coin kartlarını dinamik oluşturur."""
+    return {
+        "success":         True,
+        "static_symbols":  [
+            "BTC", "ETH", "BNB", "SOL", "XRP",
+            "AVAX", "NEAR", "SUI", "INJ", "APT",
+            "ARB", "OP", "STRK", "POL",
+            "LINK", "AAVE", "HYPE", "PENDLE", "JUP", "UNI",
+            "TAO", "AKT", "RENDER", "FET", "WLD",
+            "IMX", "DOGE", "PEPE", "BONK", "SHIB",
+        ],
+        "gainer_symbols":  _tracker_state.get("gainer_symbols", []),  # [{sym, change_24h, volume_24h}]
+        "active_symbols":  _tracker_state.get("active_symbols", []),  # Son tarama sembolleri (string list)
+        "last_scan":       _tracker_state.get("last_scan", 0),
+        "total_count":     len(_tracker_state.get("active_symbols", [])),
+    }
 
 @app.get("/api/tracker/btc-trend")
 def tracker_btc_trend():
