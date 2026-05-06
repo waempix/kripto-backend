@@ -2753,8 +2753,12 @@ def _scan_for_signals():
             if sym and ts > last_by_sym.get(sym, 0):
                 last_by_sym[sym] = ts
 
-        # Sabit COINS listesi (frontend'dekiyle aynı)
-        SCAN_SYMBOLS = [
+        # ════════════════════════════════════════════════════════════════
+        # COIN LİSTESİ — Sabit (kalite) + Dinamik (fırsat)
+        # ════════════════════════════════════════════════════════════════
+        
+        # A) Sabit "kalite" listesi — her zaman taranır
+        STATIC_SYMBOLS = [
             "BTC", "ETH", "BNB", "SOL", "XRP",
             "AVAX", "NEAR", "SUI", "INJ", "APT",
             "ARB", "OP", "STRK", "POL",
@@ -2762,6 +2766,46 @@ def _scan_for_signals():
             "TAO", "AKT", "RENDER", "FET", "WLD",
             "IMX", "DOGE", "PEPE", "BONK", "SHIB",
         ]
+        
+        # B) Dinamik "fırsat" listesi — Binance'tan en çok yükselenleri çek
+        dynamic_gainers = []
+        try:
+            tickers = get_pub("/api/v3/ticker/24hr")
+            if isinstance(tickers, list):
+                # USDT pariteleri filtrele, %5+ yükselenleri al
+                # Stable coin / leveraged token / fiat pariteleri ele
+                EXCLUDE_PATTERNS = ("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT", "USDCUSDT",
+                                    "BUSDUSDT", "DAIUSDT", "TUSDUSDT", "PAXGUSDT", "FDUSDUSDT",
+                                    "EURUSDT", "GBPUSDT", "AUDUSDT", "TRYUSDT", "BRLUSDT")
+                gainer_candidates = []
+                for t in tickers:
+                    sym = t.get("symbol", "")
+                    if not sym.endswith("USDT"):
+                        continue
+                    if any(sym.endswith(p) for p in EXCLUDE_PATTERNS):
+                        continue
+                    try:
+                        chg = float(t.get("priceChangePercent", 0))
+                        vol = float(t.get("quoteVolume", 0))
+                        # Yükselen + minimum hacim ($5M, A-Plan likidite eşiği ile uyumlu)
+                        if chg >= 5.0 and vol >= 5_000_000:
+                            base_sym = sym[:-4]  # "BTCUSDT" → "BTC"
+                            gainer_candidates.append((base_sym, chg, vol))
+                    except (ValueError, TypeError):
+                        continue
+                
+                # En çok yükselenler önce, top 30
+                gainer_candidates.sort(key=lambda x: x[1], reverse=True)
+                dynamic_gainers = [g[0] for g in gainer_candidates[:30]]
+                
+                if dynamic_gainers:
+                    top5_str = ", ".join([f"{g[0]}(+{g[1]:.0f}%)" for g in gainer_candidates[:5]])
+                    print(f"[TRACKER] 🚀 Top gainers: {top5_str}", flush=True)
+        except Exception as e:
+            print(f"[TRACKER] ⚠️ Gainer tespiti başarısız: {str(e)[:60]}", flush=True)
+        
+        # C) Sabit + Dinamik birleşim (duplicates kaldırılır, sıra korunur)
+        SCAN_SYMBOLS = list(dict.fromkeys(STATIC_SYMBOLS + dynamic_gainers))
 
         # Mevcut /api/signals endpoint'ini iç olarak çağırırsak skor üretir,
         # ama kendi içinde fiyat ve indikatör çekiyor. Daha basit yol:
@@ -2781,7 +2825,7 @@ def _scan_for_signals():
         cooldown_debug = []
         prices = _get_current_prices()
         
-        print(f"[TRACKER] 🔍 Tarama başladı — {len(SCAN_SYMBOLS)} coin", flush=True)
+        print(f"[TRACKER] 🔍 Tarama başladı — {len(SCAN_SYMBOLS)} coin ({len(STATIC_SYMBOLS)} sabit + {len(dynamic_gainers)} gainer)", flush=True)
 
         for sym in SCAN_SYMBOLS:
             try:
