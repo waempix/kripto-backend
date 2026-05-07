@@ -2952,11 +2952,13 @@ def _scan_for_signals():
                     print(f"[TRACKER] 🛡️ {sym} ZİRVE: skor {adjusted_score} + BB üst (geri dönüş riski)", flush=True)
                     continue
                 
-                # Kural 3: Skor 80+ (GÜÇLÜ AL) — sadece RSI<55 ile geçer
-                # Çünkü bu seviyede genelde aşırı alım gerçekleşir
-                if adjusted_score >= 80 and rsi_value >= 55:
+                # Kural 3: Skor 80+ → HER DURUMDA REDDEDİLİR (kanıtlanmış kayıp)
+                # 7 Mayıs verisi: 4 GÜÇLÜ AL sinyali, %0 isabet, -%3.26 ortalama
+                # IO(87) STRK(83) ZEC(84) SUI(81) - hepsi kayıp
+                # Yüksek skor = zirve göstergesi, "GÜÇLÜ AL" aslında "GÜÇLÜ ZARAR"
+                if adjusted_score >= 80:
                     skipped_adjusted += 1
-                    print(f"[TRACKER] 🛡️ {sym} GÜÇLÜ AL ama RSI {rsi_value:.1f} yüksek, atla", flush=True)
+                    print(f"[TRACKER] 🚫 {sym} skor {adjusted_score} ÇOK YÜKSEK (zirve riski) - reddedildi", flush=True)
                     continue
                 
                 # ════════════════════════════════════════════════════════════════
@@ -2980,24 +2982,39 @@ def _scan_for_signals():
                 added += 1
                 new_signals_summary.append(f"{sym}({adjusted_score})")
 
-                # ── Telegram bildirimi — AKSİYON ODAKLI (SL/TP dahil) ──
-                # NOT: GÜÇLÜ AL artık sadece RSI<55 olduğunda geliyor (FOMO koruması)
-                # Performans verisi: 65-72 sweet spot, 75+ riskli ama RSI ile filtre
+                # ── Telegram bildirimi — KULLANICI DOSTU İSİM + AKSİYON MESAJI ──
+                # NOT: Skor 80+ artık tamamen reddediliyor (kanıtlanmış kayıp)
+                # Performans verisi (7 Mayıs):
+                #   65-66 (DİP FIRSATI): %67 isabet (EN İYİ)
+                #   67-69 (İYİ ALIM):    %55 isabet
+                #   70-74 (ORTA):        %50 isabet
+                #   75-79 (RİSKLİ):      %40 isabet (zirveye yakın)
                 rsi_val = result.get('rsi', 50) or 50
+                
                 if adjusted_score >= 75:
-                    # RSI<55 zaten garantili (FOMO trap atladı)
-                    urgency = "🎯 KESİN AL"
-                    intensity = "🔥🔥🔥"
+                    # Riskli bant - zirveye yakın
+                    urgency       = "🟠 RİSKLİ"
+                    intensity     = "%40 güven"
+                    action_msg    = "⚠️ ZİRVEYE YAKIN — kaçırdıysan girme"
+                    action_detail = "Bu fiyat zaten yükseldi. Geri çekilme riski yüksek. Sadece deneyimli ve hızlı çıkış yapabilenler için."
                 elif adjusted_score >= 70:
-                    urgency = "🟢 AL"
-                    intensity = "🔥🔥"
+                    # Orta fırsat - dengeli
+                    urgency       = "🟡 ORTA FIRSAT"
+                    intensity     = "%50 güven"
+                    action_msg    = "⚠️ Yarım pozisyon düşün"
+                    action_detail = "Koşullar nötr. Riskli oynamak istiyorsan normalin yarısı kadar gir."
                 elif adjusted_score >= 67:
-                    urgency = "🟡 AL (orta)"
-                    intensity = "🔥"
+                    # İyi alım fırsatı
+                    urgency       = "🟢 İYİ ALIM"
+                    intensity     = "%55 güven"
+                    action_msg    = "✅ Alabilirsin, koşullar uygun"
+                    action_detail = "Skor sweet spot'a yakın. Normal pozisyon büyüklüğü ile gir."
                 else:
-                    # 65-66 — sweet spot bandı (DİKKATLİ AL, performans en iyi burada)
-                    urgency = "💎 DİKKATLİ AL"
-                    intensity = "✨"
+                    # 65-66: SWEET SPOT — En kârlı bant
+                    urgency       = "💎 DİP FIRSATI"
+                    intensity     = "%67 güven (EN İYİ)"
+                    action_msg    = "✅ ŞU AN ALMAK İÇİN EN İYİ ZAMAN"
+                    action_detail = "Bu bant tarihsel olarak en kazançlı sinyal bandı. Tam pozisyon büyüklüğü ile gir."
                 
                 # Kategori bazlı SL/TP (aynı _check_exits ile uyumlu)
                 exit_p = _category_exit_params(sym, adjusted_score)
@@ -3026,7 +3043,8 @@ def _scan_for_signals():
                     vol_note = "📈 hacim güçlü"
                 
                 _tg_notify(
-                    f"{urgency} {intensity}\n"
+                    f"{urgency} — {intensity}\n"
+                    f"<b>{action_msg}</b>\n"
                     f"═══════════════\n"
                     f"<b>{sym}</b> ({COIN_CATEGORIES.get(sym, 'altcoin')})\n"
                     f"💰 Giriş:  <b>${price:.6g}</b>\n"
@@ -3034,6 +3052,8 @@ def _scan_for_signals():
                     f"🎯 TP1:    ${tp1_price:.6g} (+{exit_p['tp1']:.1f}%)\n"
                     f"🎯 TP2:    ${tp2_price:.6g} (+{exit_p['tp2']:.1f}%)\n"
                     f"⏱️ Maks:   {exit_p['max_hours']}sa\n"
+                    f"───────────────\n"
+                    f"💬 <i>{action_detail}</i>\n"
                     f"───────────────\n"
                     f"📊 Skor: {adjusted_score} (raw {score})\n"
                     f"📈 RSI: {rsi_val} ({rsi_note})\n"
