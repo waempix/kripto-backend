@@ -2961,6 +2961,40 @@ def _scan_for_signals():
                     print(f"[TRACKER] 🚫 {sym} skor {adjusted_score} ÇOK YÜKSEK (zirve riski) - reddedildi", flush=True)
                     continue
                 
+                # Kural 4: ORTA FIRSAT (70-74) bandı → REDDEDİLDİ
+                # 8 May 2026 verisi: 15 sinyal, %13 isabet, -%1.63 ortalama (FELAKET!)
+                # Bu bant BTC zirvesinde altcoin momentum'u yakalıyor → SL'e değiyor
+                # Sadece İYİ ALIM (67-69) ve DİP FIRSATI (65-66) bantları kalıyor
+                if adjusted_score >= 70:
+                    skipped_adjusted += 1
+                    print(f"[TRACKER] 🚫 {sym} skor {adjusted_score} ORTA bantı reddedildi (kanıtlanmış kayıp -%1.63 ort)", flush=True)
+                    continue
+                
+                # Kural 5: BTC TREND KORUMASI (8 May 2026 eklendi)
+                # BTC son 24h'da -%2'den fazla düştüyse → hiç sinyal verme
+                # BTC son 24h zirvesinden -%3 içindeyse → zirve dönüş riski, sinyal verme
+                # Sebep: BTC dump'ında tüm altcoinler düşer, hiç AL sinyali tutmaz
+                try:
+                    market = get_market_state()
+                    btc_24h = market.get("btc_24h", 0)
+                    btc_state = market.get("state", "neutral")
+                    
+                    if btc_24h < -2.0:
+                        skipped_adjusted += 1
+                        print(f"[TRACKER] 🛑 {sym} REDDEDİLDİ - BTC -{abs(btc_24h):.1f}% düşüşte (bear market)", flush=True)
+                        continue
+                    
+                    # BTC son 24h zirvesinden çok mu yakınız? (zirve riski)
+                    # Zaten get_market_state'te btc_24h > +%2 + bullish → "bullish" diyor
+                    # Bullish'ten sonra geri çekilme riski yüksek
+                    if btc_state == "bullish" and btc_24h > 3.0:
+                        skipped_adjusted += 1
+                        print(f"[TRACKER] 🛑 {sym} REDDEDİLDİ - BTC +{btc_24h:.1f}% pump zirvesi (geri çekilme riski)", flush=True)
+                        continue
+                except Exception as btc_err:
+                    print(f"[TRACKER] ⚠️ BTC trend kontrol hatası: {btc_err}", flush=True)
+                    # Hata durumunda devam et (güvenlik için)
+                
                 # ════════════════════════════════════════════════════════════════
                 
                 # Yeni sinyal ekle (adjusted_score ile)
@@ -2983,28 +3017,14 @@ def _scan_for_signals():
                 new_signals_summary.append(f"{sym}({adjusted_score})")
 
                 # ── Telegram bildirimi — KULLANICI DOSTU İSİM + AKSİYON MESAJI ──
-                # NOT: Skor 80+ artık tamamen reddediliyor (kanıtlanmış kayıp)
-                # Performans verisi (7 Mayıs):
+                # NOT: Skor 70+ artık tamamen reddediliyor (kanıtlanmış kayıp - 8 May 2026)
+                # Sadece 65-69 bandı sinyal veriyor:
                 #   65-66 (DİP FIRSATI): %67 isabet (EN İYİ)
                 #   67-69 (İYİ ALIM):    %55 isabet
-                #   70-74 (ORTA):        %50 isabet
-                #   75-79 (RİSKLİ):      %40 isabet (zirveye yakın)
                 rsi_val = result.get('rsi', 50) or 50
                 
-                if adjusted_score >= 75:
-                    # Riskli bant - zirveye yakın
-                    urgency       = "🟠 RİSKLİ"
-                    intensity     = "%40 güven"
-                    action_msg    = "⚠️ ZİRVEYE YAKIN — kaçırdıysan girme"
-                    action_detail = "Bu fiyat zaten yükseldi. Geri çekilme riski yüksek. Sadece deneyimli ve hızlı çıkış yapabilenler için."
-                elif adjusted_score >= 70:
-                    # Orta fırsat - dengeli
-                    urgency       = "🟡 ORTA FIRSAT"
-                    intensity     = "%50 güven"
-                    action_msg    = "⚠️ Yarım pozisyon düşün"
-                    action_detail = "Koşullar nötr. Riskli oynamak istiyorsan normalin yarısı kadar gir."
-                elif adjusted_score >= 67:
-                    # İyi alım fırsatı
+                if adjusted_score >= 67:
+                    # İyi alım fırsatı (67-69)
                     urgency       = "🟢 İYİ ALIM"
                     intensity     = "%55 güven"
                     action_msg    = "✅ Alabilirsin, koşullar uygun"
