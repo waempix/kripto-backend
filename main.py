@@ -2994,7 +2994,43 @@ def _scan_for_signals():
                 except Exception as btc_err:
                     print(f"[TRACKER] ⚠️ BTC trend kontrol hatası: {btc_err}", flush=True)
                     # Hata durumunda devam et (güvenlik için)
-                
+                # ═══════════════════════════════════════════════════════════════
+                # Kural 6: İYİ ALIM (67-69) bandı için ÜÇLÜ ONAY (11 May 2026)
+                # ═══════════════════════════════════════════════════════════════
+                # Veri (11 May): 68 sinyal × %38 isabet × +%0.02 ort
+                # DİP FIRSATI (65-66) %53 isabet daha iyi
+                # Bu bantın KÖTÜ sinyallerini kesmek için 3 ek şart:
+                #   1) RSI < 50  → zirveye yakın değil
+                #   2) Hacim > 1.5x → kurumsal ilgi var (FOMO değil)
+                #   3) MACD = 1 → yeni trend başlıyor (pozitif kesişim)
+                # 3'ü birden tutmazsa REDDET
+                # DİP FIRSATI (65-66) bu kuralın DIŞINDA, dokunulmuyor
+                if 67 <= adjusted_score <= 69:
+                    rsi_val   = result.get("rsi", 50)
+                    vol_ratio = result.get("vol_ratio", 1.0)
+                    macd_val  = result.get("macd", 0)
+                    
+                    rsi_ok  = rsi_val < 50
+                    vol_ok  = vol_ratio > 1.5
+                    macd_ok = macd_val == 1
+                    
+                    # 3 şartı say
+                    pass_count = sum([rsi_ok, vol_ok, macd_ok])
+                    
+                    if pass_count < 3:
+                        skipped_adjusted += 1
+                        failed = []
+                        if not rsi_ok:  failed.append(f"RSI={rsi_val}≥50")
+                        if not vol_ok:  failed.append(f"Hacim={vol_ratio:.1f}x≤1.5")
+                        if not macd_ok: failed.append(f"MACD={macd_val}≠1")
+                        print(f"[TRACKER] 🔍 {sym} İYİ ALIM (skor {adjusted_score}) "
+                              f"üçlü onay reddedildi ({pass_count}/3): {', '.join(failed)}", 
+                              flush=True)
+                        continue
+                    
+                    print(f"[TRACKER] ✅ {sym} İYİ ALIM (skor {adjusted_score}) "
+                          f"3/3 onay geçti: RSI={rsi_val}, Hacim={vol_ratio:.1f}x, MACD=AL", 
+                          flush=True)
                 # ════════════════════════════════════════════════════════════════
                 
                 # Yeni sinyal ekle (adjusted_score ile)
