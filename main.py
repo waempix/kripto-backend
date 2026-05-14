@@ -475,6 +475,287 @@ def market_state_endpoint():
     return get_market_state()
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# 🎯 SİSTEM v3 - AKILLI PİYASA (11 May 2026)
+# 
+# Bear market'te %0 win rate sorunu için 5 katmanlı koruma:
+# 1. Makro filtre (F&G + BTC 24h/7d/30d)
+# 2. Piyasa rejimi (BULL/SIDEWAYS/BEAR/EXTREME_BEAR)
+# 3. BTC korelasyon kontrolü
+# 4. MA50 trend filtresi
+# 5. Volume profile (akümülasyon)
+# ═══════════════════════════════════════════════════════════════════════════
+
+_v3_cache = {
+    "fear_greed":      {"value": None, "ts": 0},
+    "btc_trends":      {"value": None, "ts": 0},
+    "ma50":            {},  # symbol -> {"value": ..., "ts": ...}
+    "btc_correlation": {},  # symbol -> {"value": ..., "ts": ...}
+}
+
+
+def get_fear_greed():
+    """Crypto Fear & Greed Index (alternative.me). 0=Extreme Fear, 100=Extreme Greed"""
+    cache = _v3_cache["fear_greed"]
+    if cache["value"] is not None and time.time() - cache["ts"] < 1800:  # 30 dk cache
+        return cache["value"]
+    try:
+        with urllib.request.urlopen("https://api.alternative.me/fng/?limit=1", timeout=10) as r:
+            data = json.loads(r.read().decode("utf-8"))
+            value = int(data["data"][0]["value"])
+            cache["value"] = value
+            cache["ts"]    = time.time()
+            print(f"[V3] Fear&Greed: {value}", flush=True)
+            return value
+    except Exception as e:
+        print(f"[V3] Fear&Greed hata: {e}, default=50", flush=True)
+        return 50
+
+
+def get_btc_trends():
+    """BTC 24h, 7d, 30d değişim. Cache 5 dk."""
+    cache = _v3_cache["btc_trends"]
+    if cache["value"] is not None and time.time() - cache["ts"] < 300:
+        return cache["value"]
+    try:
+        ticker = get_pub("/api/v3/ticker/24hr", {"symbol": "BTCUSDT"})
+        change_24h = float(ticker["priceChangePercent"])
+        
+        klines = get_pub("/api/v3/klines", {"symbol": "BTCUSDT", "interval": "1d", "limit": 31})
+        if len(klines) >= 31:
+            current_price = float(klines[-1][4])
+            price_7d_ago  = float(klines[-8][4])
+            price_30d_ago = float(klines[0][4])
+            change_7d  = (current_price - price_7d_ago)  / price_7d_ago  * 100
+            change_30d = (current_price - price_30d_ago) / price_30d_ago * 100
+        else:
+            change_7d = 0
+            change_30d = 0
+        
+        result = {
+            "change_24h": round(change_24h, 2),
+            "change_7d":  round(change_7d, 2),
+            "change_30d": round(change_30d, 2),
+        }
+        cache["value"] = result
+        cache["ts"]    = time.time()
+        print(f"[V3] BTC: 24h={change_24h:.1f}%, 7d={change_7d:.1f}%, 30d={change_30d:.1f}%", flush=True)
+        return result
+    except Exception as e:
+        print(f"[V3] BTC trend hata: {e}", flush=True)
+        return {"change_24h": 0, "change_7d": 0, "change_30d": 0}
+
+
+def get_market_regime():
+    """
+    Piyasa rejimini belirle: BULL / SIDEWAYS / BEAR / EXTREME_BEAR
+    """
+    fg = get_fear_greed()
+    btc = get_btc_trends()
+    
+    danger = 0
+    bullish = 0
+    
+    # Fear & Greed
+    if fg < 20:    danger += 2
+    elif fg < 30:  danger += 1
+    elif fg > 75:  danger += 1
+    elif 40 <= fg <= 60: bullish += 1
+    elif fg > 60:  bullish += 2
+    
+    # BTC 24h
+    if btc["change_24h"] < -3: danger += 2
+    elif btc["change_24h"] < -1: danger += 1
+    elif btc["change_24h"] > 2: bullish += 1
+    
+    # BTC 7d
+    if btc["change_7d"] < -10: danger += 2
+    elif btc["change_7d"] < -5: danger += 1
+    elif btc["change_7d"] > 5: bullish += 1
+    
+    # BTC 30d (yapısal trend)
+    if btc["change_30d"] < -15: danger += 2
+    elif btc["change_30d"] < -8: danger += 1
+    elif btc["change_30d"] > 10: bullish += 2
+    elif btc["change_30d"] > 5: bullish += 1
+    
+    # Rejim belirleme
+    if danger >= 5:
+        regime = "EXTREME_BEAR"
+        allow = False
+        bands = []
+        rec = "🛑 Sistem KAPALI - Bear market panik. F&G > 25 ve BTC pozitif olunca açılır."
+    elif danger >= 3:
+        regime = "BEAR"
+        allow = False
+        bands = []
+        rec = "🛑 Sistem KAPALI - Bear market koşulları. Lokal dipler tuzak olabilir."
+    elif danger == 2:
+        regime = "SIDEWAYS"
+        allow = True
+        bands = [(65, 66)]  # Sadece DİP FIRSATI
+        rec = "⚠️ Belirsiz piyasa - Sadece DİP FIRSATI (65-66) bandı sinyal verir."
+    elif danger <= 1 and bullish <= 2:
+        regime = "SIDEWAYS"
+        allow = True
+        bands = [(65, 69)]  # DİP + İYİ ALIM
+        rec = "🟡 Yan piyasa - Normal sistem çalışır (65-69)."
+    else:
+        regime = "BULL"
+        allow = True
+        bands = [(65, 74)]  # DİP + İYİ ALIM + ORTA
+        rec = "🟢 Bull market - Geniş sinyal aralığı (65-74)."
+    
+    return {
+        "regime":         regime,
+        "score":          max(0, min(10, bullish - danger + 5)),
+        "danger":         danger,
+        "bullish":        bullish,
+        "fear_greed":     fg,
+        "btc_24h":        btc["change_24h"],
+        "btc_7d":         btc["change_7d"],
+        "btc_30d":        btc["change_30d"],
+        "recommendation": rec,
+        "allow_signals":  allow,
+        "allowed_bands":  bands,
+    }
+
+
+def get_ma50(symbol):
+    """Symbol'un 50 günlük MA üstünde mi?"""
+    cache = _v3_cache["ma50"].get(symbol)
+    if cache and time.time() - cache["ts"] < 3600:  # 1 saat cache
+        return cache["value"]
+    try:
+        klines = get_pub("/api/v3/klines", {"symbol": symbol + "USDT", "interval": "1d", "limit": 50})
+        if len(klines) < 50:
+            return None
+        closes = [float(k[4]) for k in klines]
+        ma50 = sum(closes) / 50
+        current = closes[-1]
+        above = current > ma50
+        distance_pct = (current - ma50) / ma50 * 100
+        result = {
+            "ma50":         round(ma50, 8),
+            "current":      round(current, 8),
+            "above":        above,
+            "distance_pct": round(distance_pct, 2),
+        }
+        _v3_cache["ma50"][symbol] = {"value": result, "ts": time.time()}
+        return result
+    except Exception as e:
+        return None
+
+
+def get_btc_correlation(symbol):
+    """Sembolün son 30 günde BTC ile korelasyon katsayısı (-1 ile 1 arası)"""
+    cache = _v3_cache["btc_correlation"].get(symbol)
+    if cache and time.time() - cache["ts"] < 3600:
+        return cache["value"]
+    try:
+        sym_klines = get_pub("/api/v3/klines", {"symbol": symbol + "USDT", "interval": "1d", "limit": 30})
+        btc_klines = get_pub("/api/v3/klines", {"symbol": "BTCUSDT", "interval": "1d", "limit": 30})
+        
+        if len(sym_klines) < 30 or len(btc_klines) < 30:
+            return 0.7  # Default - çoğu altcoin BTC ile korele
+        
+        sym_changes = [(float(sym_klines[i][4]) - float(sym_klines[i-1][4])) / float(sym_klines[i-1][4]) 
+                       for i in range(1, 30)]
+        btc_changes = [(float(btc_klines[i][4]) - float(btc_klines[i-1][4])) / float(btc_klines[i-1][4]) 
+                       for i in range(1, 30)]
+        
+        n = len(sym_changes)
+        mean_sym = sum(sym_changes) / n
+        mean_btc = sum(btc_changes) / n
+        cov = sum((sym_changes[i] - mean_sym) * (btc_changes[i] - mean_btc) for i in range(n))
+        var_sym = sum((x - mean_sym) ** 2 for x in sym_changes) ** 0.5
+        var_btc = sum((x - mean_btc) ** 2 for x in btc_changes) ** 0.5
+        
+        corr = 0 if (var_sym == 0 or var_btc == 0) else cov / (var_sym * var_btc)
+        result = round(corr, 3)
+        _v3_cache["btc_correlation"][symbol] = {"value": result, "ts": time.time()}
+        return result
+    except Exception as e:
+        return 0.7
+
+
+def get_volume_profile(symbol):
+    """Son 1000 trade'de alıcı/satıcı baskısı"""
+    try:
+        with urllib.request.urlopen(
+            f"https://api.binance.com/api/v3/aggTrades?symbol={symbol}USDT&limit=1000",
+            timeout=10
+        ) as r:
+            trades = json.loads(r.read().decode("utf-8"))
+        
+        if not trades:
+            return {"buy_pct": 50, "sell_pct": 50, "is_accumulation": False}
+        
+        # m=true → maker sell, alıcı agresif (BUY)
+        # m=false → maker buy, satıcı agresif (SELL)
+        buy_volume  = sum(float(t["q"]) * float(t["p"]) for t in trades if t["m"] == True)
+        sell_volume = sum(float(t["q"]) * float(t["p"]) for t in trades if t["m"] == False)
+        total = buy_volume + sell_volume
+        
+        if total == 0:
+            return {"buy_pct": 50, "sell_pct": 50, "is_accumulation": False}
+        
+        buy_pct = round(buy_volume / total * 100, 1)
+        return {
+            "buy_pct":         buy_pct,
+            "sell_pct":        round(100 - buy_pct, 1),
+            "is_accumulation": buy_pct > 55,
+        }
+    except Exception as e:
+        return {"buy_pct": 50, "sell_pct": 50, "is_accumulation": False}
+
+
+@app.get("/api/market-regime")
+def market_regime_endpoint():
+    """Sistem v3 - Piyasa rejimi endpoint (frontend için)"""
+    try:
+        market = get_market_regime()
+        return {
+            "success":   True,
+            "data":      market,
+            "timestamp": time.time(),
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.get("/api/v3/coin-analysis/{symbol}")
+def coin_analysis_v3(symbol: str):
+    """Bir coin'in detaylı v3 analizi (debug + UI için)"""
+    try:
+        sym = symbol.upper()
+        market = get_market_regime()
+        ma50 = get_ma50(sym)
+        correlation = get_btc_correlation(sym)
+        volume = get_volume_profile(sym)
+        
+        rejected_by = []
+        if market["btc_24h"] < -1 and correlation > 0.7:
+            rejected_by.append(f"BTC korelasyon {correlation:.2f} + BTC düşüşte")
+        if ma50 and not ma50["above"] and ma50["distance_pct"] < -10:
+            rejected_by.append(f"MA50'den %{ma50['distance_pct']:.1f} altta")
+        if market["regime"] in ("SIDEWAYS", "BEAR") and volume["buy_pct"] < 45:
+            rejected_by.append(f"Alıcı baskısı %{volume['buy_pct']}")
+        
+        return {
+            "success":         True,
+            "symbol":          sym,
+            "market":          market,
+            "ma50":            ma50,
+            "btc_correlation": correlation,
+            "volume_profile":  volume,
+            "rejected_by":     rejected_by,
+            "would_pass":      len(rejected_by) == 0 and market["allow_signals"],
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 def compute_smart_score(symbol, use_orderbook=True):
     sym = symbol.upper() + "USDT"
     ticker = get_pub("/api/v3/ticker/24hr", {"symbol": sym})
@@ -2740,6 +3021,43 @@ def _check_exits():
 def _scan_for_signals():
     """Backend'in /api/signals endpoint'ini çağırır, skor 68+ olanları kaydet."""
     try:
+        # ════════════════════════════════════════════════════════════════
+        # 🛡️ KURAL 0: MAKRO FİLTRE - SİSTEM v3 (11 May 2026)
+        # ════════════════════════════════════════════════════════════════
+        # Piyasa rejimi kontrolü. Bear market'te SİSTEM KAPALI.
+        # Bu kontrol diğer tüm kurallardan önce yapılır.
+        
+        market_v3 = get_market_regime()
+        print(f"[TRACKER] 🌍 Piyasa Rejimi: {market_v3['regime']} | "
+              f"F&G={market_v3['fear_greed']} | "
+              f"BTC: 24h={market_v3['btc_24h']}% 7d={market_v3['btc_7d']}% 30d={market_v3['btc_30d']}% | "
+              f"Tehlike={market_v3['danger']} Bullish={market_v3['bullish']}", flush=True)
+        print(f"[TRACKER] 📋 {market_v3['recommendation']}", flush=True)
+        
+        # Eğer sistem kapalıysa hiç sinyal verme - sadece izleme
+        if not market_v3["allow_signals"]:
+            _tracker_state["last_scan_time"]   = int(time.time())
+            _tracker_state["last_scan_market"] = market_v3
+            _tracker_state["last_scan_status"] = market_v3["recommendation"]
+            print(f"[TRACKER] 🛑 Tarama atlandı - {market_v3['regime']} modu (sinyal yok)", flush=True)
+            
+            # Telegram'a sadece günde 1 kez bilgi gönder (spam olmasın)
+            now_h = int(time.time() / 3600)
+            last_h = _tracker_state.get("last_bear_notif_h", 0)
+            if now_h - last_h >= 24:  # 24 saatte 1 mesaj
+                _tg_notify(
+                    f"🛑 <b>Sistem Beklemede</b>\n\n"
+                    f"Piyasa: {market_v3['regime']}\n"
+                    f"F&G: {market_v3['fear_greed']}\n"
+                    f"BTC 24h: {market_v3['btc_24h']}%\n"
+                    f"BTC 30d: {market_v3['btc_30d']}%\n\n"
+                    f"{market_v3['recommendation']}\n\n"
+                    f"Piyasa düzelince otomatik sinyaller başlar."
+                )
+                _tracker_state["last_bear_notif_h"] = now_h
+            return
+        
+        # ════════════════════════════════════════════════════════════════
         # Mevcut sinyalleri çek
         existing = _fb_get_signals()
         now_ms = int(time.time() * 1000)
@@ -2994,43 +3312,101 @@ def _scan_for_signals():
                 except Exception as btc_err:
                     print(f"[TRACKER] ⚠️ BTC trend kontrol hatası: {btc_err}", flush=True)
                     # Hata durumunda devam et (güvenlik için)
-                # ═══════════════════════════════════════════════════════════════
-                # Kural 6: İYİ ALIM (67-69) bandı için ÜÇLÜ ONAY (11 May 2026)
-                # ═══════════════════════════════════════════════════════════════
-                # Veri (11 May): 68 sinyal × %38 isabet × +%0.02 ort
-                # DİP FIRSATI (65-66) %53 isabet daha iyi
-                # Bu bantın KÖTÜ sinyallerini kesmek için 3 ek şart:
-                #   1) RSI < 50  → zirveye yakın değil
-                #   2) Hacim > 1.5x → kurumsal ilgi var (FOMO değil)
-                #   3) MACD = 1 → yeni trend başlıyor (pozitif kesişim)
-                # 3'ü birden tutmazsa REDDET
-                # DİP FIRSATI (65-66) bu kuralın DIŞINDA, dokunulmuyor
+                
+                # ════════════════════════════════════════════════════════════════
+                # Kural 6: İYİ ALIM (67-69) ÜÇLÜ ONAY (11 May 2026)
+                # ════════════════════════════════════════════════════════════════
+                # 11 May verisi: İYİ ALIM 68 sinyal × %38 isabet × +%0.02 (zayıf)
+                # 3 ek şart: RSI<50 + Hacim>1.5x + MACD=AL
+                # 3'ü birden tutmazsa REDDET (DİP FIRSATI 65-66 dokunulmuyor)
                 if 67 <= adjusted_score <= 69:
-                    rsi_val   = result.get("rsi", 50)
-                    vol_ratio = result.get("vol_ratio", 1.0)
-                    macd_val  = result.get("macd", 0)
+                    rsi_val   = result.get("rsi", 50) or 50
+                    vol_ratio = result.get("vol_ratio", 1.0) or 1.0
+                    macd_val  = result.get("macd", 0) or 0
                     
                     rsi_ok  = rsi_val < 50
                     vol_ok  = vol_ratio > 1.5
                     macd_ok = macd_val == 1
                     
-                    # 3 şartı say
                     pass_count = sum([rsi_ok, vol_ok, macd_ok])
                     
                     if pass_count < 3:
                         skipped_adjusted += 1
                         failed = []
-                        if not rsi_ok:  failed.append(f"RSI={rsi_val}≥50")
+                        if not rsi_ok:  failed.append(f"RSI={rsi_val:.0f}≥50")
                         if not vol_ok:  failed.append(f"Hacim={vol_ratio:.1f}x≤1.5")
                         if not macd_ok: failed.append(f"MACD={macd_val}≠1")
                         print(f"[TRACKER] 🔍 {sym} İYİ ALIM (skor {adjusted_score}) "
-                              f"üçlü onay reddedildi ({pass_count}/3): {', '.join(failed)}", 
-                              flush=True)
+                              f"üçlü onay reddedildi ({pass_count}/3): {', '.join(failed)}", flush=True)
                         continue
                     
                     print(f"[TRACKER] ✅ {sym} İYİ ALIM (skor {adjusted_score}) "
-                          f"3/3 onay geçti: RSI={rsi_val}, Hacim={vol_ratio:.1f}x, MACD=AL", 
+                          f"3/3 onay geçti: RSI={rsi_val:.0f}, Hacim={vol_ratio:.1f}x, MACD=AL", flush=True)
+                
+                # ════════════════════════════════════════════════════════════════
+                # Kural 7: SADECE İZİN VERİLEN BANTLAR (Sistem v3)
+                # ════════════════════════════════════════════════════════════════
+                # Piyasa rejimine göre hangi skor bantları sinyal verebilir?
+                in_allowed_band = False
+                for (low, high) in market_v3["allowed_bands"]:
+                    if low <= adjusted_score <= high:
+                        in_allowed_band = True
+                        break
+                
+                if not in_allowed_band:
+                    skipped_adjusted += 1
+                    print(f"[TRACKER] 🌍 {sym} skor {adjusted_score} - "
+                          f"{market_v3['regime']} modunda izin verilmez (izinli bant: {market_v3['allowed_bands']})", 
                           flush=True)
+                    continue
+                
+                # ════════════════════════════════════════════════════════════════
+                # Kural 8: BTC KORELASYON KONTROLÜ (Sistem v3)
+                # ════════════════════════════════════════════════════════════════
+                # BTC düşerken yüksek korele altcoin pump yapamaz
+                if market_v3["btc_24h"] < -1:
+                    try:
+                        correlation = get_btc_correlation(sym)
+                        if correlation > 0.7:
+                            skipped_adjusted += 1
+                            print(f"[TRACKER] 🔗 {sym} BTC korelasyon {correlation:.2f} (>0.7) "
+                                  f"+ BTC 24h {market_v3['btc_24h']}% → reddedildi", flush=True)
+                            continue
+                    except Exception as corr_err:
+                        print(f"[TRACKER] ⚠️ Korelasyon hatası {sym}: {corr_err}", flush=True)
+                
+                # ════════════════════════════════════════════════════════════════
+                # Kural 9: MA50 TREND FİLTRESİ (Sistem v3)
+                # ════════════════════════════════════════════════════════════════
+                # Uzun vadeli trend kontrolü. MA50'den -%10'dan fazla altta = bearish
+                try:
+                    ma50_data = get_ma50(sym)
+                    if ma50_data and not ma50_data["above"]:
+                        if ma50_data["distance_pct"] < -10:
+                            skipped_adjusted += 1
+                            print(f"[TRACKER] 📉 {sym} MA50'den %{ma50_data['distance_pct']:.1f} altta - "
+                                  f"long-term bearish, reddedildi", flush=True)
+                            continue
+                except Exception as ma_err:
+                    print(f"[TRACKER] ⚠️ MA50 hatası {sym}: {ma_err}", flush=True)
+                
+                # ════════════════════════════════════════════════════════════════
+                # Kural 10: HACİM PROFİLE - AKÜMÜLASYON (Sistem v3)
+                # ════════════════════════════════════════════════════════════════
+                # Bear/sideways'te alıcı baskısı kritik
+                if market_v3["regime"] in ("SIDEWAYS", "BEAR"):
+                    try:
+                        vol_profile = get_volume_profile(sym)
+                        if vol_profile["buy_pct"] < 45:
+                            skipped_adjusted += 1
+                            print(f"[TRACKER] 📊 {sym} alıcı baskısı %{vol_profile['buy_pct']} "
+                                  f"(<%45) → akümülasyon yok, reddedildi", flush=True)
+                            continue
+                        if vol_profile["is_accumulation"]:
+                            print(f"[TRACKER] 🟢 {sym} akümülasyon tespit: alıcı %{vol_profile['buy_pct']}", flush=True)
+                    except Exception as vol_err:
+                        print(f"[TRACKER] ⚠️ Volume hatası {sym}: {vol_err}", flush=True)
+                
                 # ════════════════════════════════════════════════════════════════
                 
                 # Yeni sinyal ekle (adjusted_score ile)
