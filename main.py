@@ -930,7 +930,8 @@ def signals(symbols: str = ""):
         now = time.time()
         key = ",".join(sorted(syms))
         if _signals_cache["key"] == key and (now - _signals_cache["ts"]) < 90:
-            return {"success": True, "cached": True, "signals": _signals_cache["data"]}
+            return {"success": True, "cached": True, "signals": _signals_cache["data"], 
+                    "market_regime": _signals_cache.get("market_regime")}
 
         out = {}
         for sym in syms:
@@ -939,8 +940,52 @@ def signals(symbols: str = ""):
             except Exception as err:
                 out[sym] = {"error": str(err)}
 
-        _signals_cache.update({"ts": now, "key": key, "data": out})
-        return {"success": True, "cached": False, "signals": out}
+        # ═══════════════════════════════════════════════════════════════════
+        # 🛡️ SİSTEM v3 - Endpoint Filter (11 May 2026)
+        # ═══════════════════════════════════════════════════════════════════
+        # Tracker'da olduğu gibi /api/signals endpoint'i de piyasa rejimine
+        # göre skorları filtrelesin. Frontend artık 73 gibi izinsiz skorları
+        # görmesin.
+        try:
+            market_v3 = get_market_regime()
+            
+            # Her skor için "izin verildi mi" işareti koy
+            for sym, data in out.items():
+                if "error" in data:
+                    continue
+                
+                score = data.get("score", 0)
+                
+                # Hangi bantta?
+                in_allowed = False
+                for (low, high) in market_v3["allowed_bands"]:
+                    if low <= score <= high:
+                        in_allowed = True
+                        break
+                
+                # İzin verilmemişse → meta bilgi ekle (frontend gizleyebilir)
+                data["v3_allowed"] = in_allowed
+                data["v3_regime"]  = market_v3["regime"]
+                
+                # Eğer Kural 4 etkindeyse (>=70 hep reddedilir), skor 70+ ise işaret
+                if score >= 70:
+                    data["v3_rejected_reason"] = "ORTA bantı (kural 4: -%1.63 ort kayıp)"
+                elif not in_allowed:
+                    data["v3_rejected_reason"] = f"{market_v3['regime']} modunda izinsiz bant"
+            
+            _signals_cache.update({
+                "ts": now, "key": key, "data": out, 
+                "market_regime": market_v3
+            })
+            return {
+                "success": True, "cached": False, "signals": out,
+                "market_regime": market_v3
+            }
+        except Exception as v3_err:
+            print(f"[V3] /api/signals filter hatası: {v3_err}", flush=True)
+            # v3 hata ederse normal devam et
+            _signals_cache.update({"ts": now, "key": key, "data": out})
+            return {"success": True, "cached": False, "signals": out}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -3361,46 +3406,57 @@ def _scan_for_signals():
                     continue
                 
                 # ════════════════════════════════════════════════════════════════
-                # Kural 8: BTC KORELASYON KONTROLÜ (Sistem v3)
+                # Kural 8: BTC KORELASYON KONTROLÜ (Sistem v3) - SIKILAŞTIRILDI
                 # ════════════════════════════════════════════════════════════════
-                # BTC düşerken yüksek korele altcoin pump yapamaz
-                if market_v3["btc_24h"] < -1:
+                # ESKİ: BTC -%1+ düştüğünde korelasyon 0.7+ → reddet (çok gevşek)
+                # YENİ: SIDEWAYS/BEAR'de HER ZAMAN korelasyon 0.6+ → reddet
+                # 15 May verisi: SOL/AAVE/AVAX/LINK 0.7+ korele, hepsi SL'ye değdi
+                if market_v3["regime"] in ("SIDEWAYS", "BEAR", "EXTREME_BEAR"):
                     try:
                         correlation = get_btc_correlation(sym)
-                        if correlation > 0.7:
+                        if correlation > 0.6:  # 0.7 → 0.6 (sıkılaştırıldı)
                             skipped_adjusted += 1
-                            print(f"[TRACKER] 🔗 {sym} BTC korelasyon {correlation:.2f} (>0.7) "
-                                  f"+ BTC 24h {market_v3['btc_24h']}% → reddedildi", flush=True)
+                            print(f"[TRACKER] 🔗 {sym} BTC korelasyon {correlation:.2f} (>0.6) "
+                                  f"+ {market_v3['regime']} modu → reddedildi", flush=True)
                             continue
                     except Exception as corr_err:
                         print(f"[TRACKER] ⚠️ Korelasyon hatası {sym}: {corr_err}", flush=True)
                 
                 # ════════════════════════════════════════════════════════════════
-                # Kural 9: MA50 TREND FİLTRESİ (Sistem v3)
+                # Kural 9: MA50 TREND FİLTRESİ (Sistem v3) - SIKILAŞTIRILDI
                 # ════════════════════════════════════════════════════════════════
-                # Uzun vadeli trend kontrolü. MA50'den -%10'dan fazla altta = bearish
+                # ESKİ: Sadece MA50'nin -%10 altında reddet (çok gevşek)
+                # YENİ: SIDEWAYS/BEAR'de MA50 üstünde değilse reddet
+                # BULL'da -%10 altı reddet (eski mantık)
                 try:
                     ma50_data = get_ma50(sym)
                     if ma50_data and not ma50_data["above"]:
-                        if ma50_data["distance_pct"] < -10:
+                        if market_v3["regime"] in ("SIDEWAYS", "BEAR", "EXTREME_BEAR"):
+                            skipped_adjusted += 1
+                            print(f"[TRACKER] 📉 {sym} MA50 altında %{ma50_data['distance_pct']:.1f} - "
+                                  f"{market_v3['regime']} modunda kabul edilmez", flush=True)
+                            continue
+                        elif ma50_data["distance_pct"] < -10:
                             skipped_adjusted += 1
                             print(f"[TRACKER] 📉 {sym} MA50'den %{ma50_data['distance_pct']:.1f} altta - "
-                                  f"long-term bearish, reddedildi", flush=True)
+                                  f"BULL'da bile çok düşük, reddedildi", flush=True)
                             continue
                 except Exception as ma_err:
                     print(f"[TRACKER] ⚠️ MA50 hatası {sym}: {ma_err}", flush=True)
                 
                 # ════════════════════════════════════════════════════════════════
-                # Kural 10: HACİM PROFİLE - AKÜMÜLASYON (Sistem v3)
+                # Kural 10: HACİM PROFİLE - AKÜMÜLASYON (Sistem v3) - SIKILAŞTIRILDI
                 # ════════════════════════════════════════════════════════════════
-                # Bear/sideways'te alıcı baskısı kritik
-                if market_v3["regime"] in ("SIDEWAYS", "BEAR"):
+                # ESKİ: Alıcı baskısı <%45 reddet (çok gevşek)
+                # YENİ: Alıcı baskısı <%52 reddet (gerçek akümülasyon)
+                # 15 May verisi: %46-50 arası coin'ler hep kayıp etti
+                if market_v3["regime"] in ("SIDEWAYS", "BEAR", "EXTREME_BEAR"):
                     try:
                         vol_profile = get_volume_profile(sym)
-                        if vol_profile["buy_pct"] < 45:
+                        if vol_profile["buy_pct"] < 52:  # 45 → 52 (sıkılaştırıldı)
                             skipped_adjusted += 1
                             print(f"[TRACKER] 📊 {sym} alıcı baskısı %{vol_profile['buy_pct']} "
-                                  f"(<%45) → akümülasyon yok, reddedildi", flush=True)
+                                  f"(<%52) → akümülasyon yetersiz, reddedildi", flush=True)
                             continue
                         if vol_profile["is_accumulation"]:
                             print(f"[TRACKER] 🟢 {sym} akümülasyon tespit: alıcı %{vol_profile['buy_pct']}", flush=True)
