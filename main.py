@@ -710,6 +710,330 @@ def get_volume_profile(symbol):
         return {"buy_pct": 50, "sell_pct": 50, "is_accumulation": False}
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# 🎯 SİSTEM v3.2 - YENİ ENTEGRASYONLAR (16 May 2026)
+# 
+# 1. BTC Dominance + Altcoin Sezonu (CoinGecko Global)
+# 2. Whale Alert (Büyük transferler)
+# 3. CryptoPanic (Haber sentiment)
+# ═══════════════════════════════════════════════════════════════════════════
+
+_v3_cache.update({
+    "btc_dominance":   {"value": None, "ts": 0},
+    "altcoin_season":  {"value": None, "ts": 0},
+    "whale_data":      {},   # symbol -> {"value": ..., "ts": ...}
+    "news_sentiment":  {},   # symbol -> {"value": ..., "ts": ...}
+    "trending_coins":  {"value": None, "ts": 0},
+})
+
+
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ 1. BTC DOMINANCE + ALTCOIN SEZONU                                       │
+# └─────────────────────────────────────────────────────────────────────────┘
+
+def get_btc_dominance():
+    """
+    BTC dominance + altcoin sezonu analizi (CoinGecko Global API)
+    Returns: dict {dominance, altcoin_season, market_cap_change_24h, ...}
+    """
+    cache = _v3_cache["btc_dominance"]
+    if cache["value"] is not None and time.time() - cache["ts"] < 600:  # 10 dk cache
+        return cache["value"]
+    
+    try:
+        with urllib.request.urlopen("https://api.coingecko.com/api/v3/global", timeout=10) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        
+        market_data = data.get("data", {})
+        market_cap_pct = market_data.get("market_cap_percentage", {})
+        btc_dom = round(market_cap_pct.get("btc", 50), 2)
+        eth_dom = round(market_cap_pct.get("eth", 15), 2)
+        
+        # Altcoin sezonu mantığı:
+        # BTC dom < 50% → Strong altcoin season
+        # BTC dom 50-55% → Mild altcoin season  
+        # BTC dom 55-60% → Neutral
+        # BTC dom > 60% → BTC season (altcoinler düşer)
+        if btc_dom < 50:
+            altcoin_state = "STRONG_ALTSEASON"
+            altcoin_score = 10
+            recommendation = "🟢 Güçlü altcoin sezonu - altcoinler iyi performans"
+        elif btc_dom < 55:
+            altcoin_state = "MILD_ALTSEASON"
+            altcoin_score = 7
+            recommendation = "🟡 Hafif altcoin sezonu - seçici altcoin alım"
+        elif btc_dom < 60:
+            altcoin_state = "NEUTRAL"
+            altcoin_score = 5
+            recommendation = "⚪ Nötr - dikkatli ol"
+        else:
+            altcoin_state = "BTC_SEASON"
+            altcoin_score = 2
+            recommendation = "🔴 BTC sezonu - altcoinler zayıf, sadece BTC/ETH"
+        
+        result = {
+            "btc_dominance":         btc_dom,
+            "eth_dominance":         eth_dom,
+            "altcoin_state":         altcoin_state,
+            "altcoin_score":         altcoin_score,
+            "market_cap_change_24h": round(market_data.get("market_cap_change_percentage_24h_usd", 0), 2),
+            "total_market_cap_usd":  market_data.get("total_market_cap", {}).get("usd", 0),
+            "total_volume_24h":      market_data.get("total_volume", {}).get("usd", 0),
+            "recommendation":        recommendation,
+        }
+        
+        cache["value"] = result
+        cache["ts"]    = time.time()
+        print(f"[V3] BTC Dom: {btc_dom}% | State: {altcoin_state} | Score: {altcoin_score}/10", flush=True)
+        return result
+        
+    except Exception as e:
+        print(f"[V3] BTC Dominance hata: {e}", flush=True)
+        return {
+            "btc_dominance": 55, "eth_dominance": 15,
+            "altcoin_state": "NEUTRAL", "altcoin_score": 5,
+            "market_cap_change_24h": 0, "recommendation": "⚪ Veri alınamadı"
+        }
+
+
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ 2. WHALE ALERT - Büyük Transferler                                      │
+# └─────────────────────────────────────────────────────────────────────────┘
+
+def get_whale_activity(symbol):
+    """
+    Bir sembolün son 24 saatlik balina aktivitesi
+    Borsa giriş/çıkış oranını analiz eder (Binance public API ile)
+    
+    Mantık: Büyük cüzdan hareketleri için Binance'in 'aggTrades'ında
+    $100K+ tek işlemleri sayıyoruz. Bu balina aktivitesi proxy'sidir.
+    
+    Returns: dict {large_trades_count, net_flow_estimate, sentiment, ...}
+    """
+    cache = _v3_cache["whale_data"].get(symbol)
+    if cache and time.time() - cache["ts"] < 600:  # 10 dk cache
+        return cache["value"]
+    
+    try:
+        # Son 1000 trade
+        with urllib.request.urlopen(
+            f"https://api.binance.com/api/v3/aggTrades?symbol={symbol}USDT&limit=1000",
+            timeout=10
+        ) as r:
+            trades = json.loads(r.read().decode("utf-8"))
+        
+        if not trades:
+            return {"sentiment": "neutral", "score_adj": 0}
+        
+        # $50K+ işlemleri "balina" olarak say
+        WHALE_THRESHOLD = 50000  # USD
+        
+        whale_buys = 0
+        whale_sells = 0
+        whale_buy_volume = 0
+        whale_sell_volume = 0
+        
+        for t in trades:
+            usd_value = float(t["q"]) * float(t["p"])
+            if usd_value >= WHALE_THRESHOLD:
+                if t["m"]:  # maker sell, alıcı agresif = BUY
+                    whale_buys += 1
+                    whale_buy_volume += usd_value
+                else:
+                    whale_sells += 1
+                    whale_sell_volume += usd_value
+        
+        total_whale_count = whale_buys + whale_sells
+        net_flow = whale_buy_volume - whale_sell_volume
+        
+        # Sentiment belirleme
+        if total_whale_count == 0:
+            sentiment = "no_activity"
+            score_adj = 0
+        elif net_flow > 200000:  # +$200K net alım
+            sentiment = "strong_accumulation"
+            score_adj = +10
+        elif net_flow > 50000:
+            sentiment = "accumulation"
+            score_adj = +5
+        elif net_flow < -200000:  # -$200K net satış
+            sentiment = "strong_distribution"
+            score_adj = -10
+        elif net_flow < -50000:
+            sentiment = "distribution"
+            score_adj = -5
+        else:
+            sentiment = "neutral"
+            score_adj = 0
+        
+        result = {
+            "whale_buys":        whale_buys,
+            "whale_sells":       whale_sells,
+            "whale_buy_volume":  round(whale_buy_volume, 0),
+            "whale_sell_volume": round(whale_sell_volume, 0),
+            "net_flow":          round(net_flow, 0),
+            "total_whales":      total_whale_count,
+            "sentiment":         sentiment,
+            "score_adj":         score_adj,
+        }
+        
+        _v3_cache["whale_data"][symbol] = {"value": result, "ts": time.time()}
+        return result
+        
+    except Exception as e:
+        return {"sentiment": "error", "score_adj": 0, "error": str(e)}
+
+
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ 3. CRYPTOPANIC HABER SENTIMENT                                          │
+# └─────────────────────────────────────────────────────────────────────────┘
+
+def get_news_sentiment(symbol):
+    """
+    CryptoPanic API'den sembol bazlı haber sentiment analizi
+    Returns: dict {bullish_count, bearish_count, sentiment, score_adj, ...}
+    """
+    cache = _v3_cache["news_sentiment"].get(symbol)
+    if cache and time.time() - cache["ts"] < 1800:  # 30 dk cache
+        return cache["value"]
+    
+    try:
+        # CryptoPanic free endpoint - public, no API key needed
+        url = f"https://cryptopanic.com/api/free/v1/posts/?currencies={symbol}&kind=news&public=true"
+        with urllib.request.urlopen(url, timeout=10) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        
+        posts = data.get("results", [])
+        if not posts:
+            return {"sentiment": "no_news", "score_adj": 0, "count": 0}
+        
+        # Son 24 saat haberlerini analiz et
+        cutoff_time = time.time() - (24 * 3600)
+        
+        bullish = 0
+        bearish = 0
+        important = 0
+        total = 0
+        
+        for post in posts:
+            # Tarih kontrolü
+            try:
+                from datetime import datetime
+                post_time = datetime.fromisoformat(post.get("published_at", "").replace("Z", "+00:00")).timestamp()
+                if post_time < cutoff_time:
+                    continue
+            except:
+                pass
+            
+            total += 1
+            
+            votes = post.get("votes", {})
+            positive = votes.get("positive", 0)
+            negative = votes.get("negative", 0)
+            important_votes = votes.get("important", 0)
+            
+            if positive > negative:
+                bullish += 1
+            elif negative > positive:
+                bearish += 1
+            
+            if important_votes >= 3:
+                important += 1
+        
+        if total == 0:
+            sentiment = "no_recent_news"
+            score_adj = 0
+        elif bullish >= bearish * 2:  # 2x daha fazla bullish
+            sentiment = "very_bullish"
+            score_adj = +8
+        elif bullish > bearish:
+            sentiment = "bullish"
+            score_adj = +4
+        elif bearish >= bullish * 2:
+            sentiment = "very_bearish"
+            score_adj = -12  # Negatif haberler daha çok etki
+        elif bearish > bullish:
+            sentiment = "bearish"
+            score_adj = -6
+        else:
+            sentiment = "neutral"
+            score_adj = 0
+        
+        # Important haber varsa ekstra etki
+        if important >= 2:
+            if sentiment in ("very_bullish", "bullish"):
+                score_adj += 3
+            elif sentiment in ("very_bearish", "bearish"):
+                score_adj -= 4
+        
+        result = {
+            "total_news":     total,
+            "bullish_count":  bullish,
+            "bearish_count":  bearish,
+            "important_news": important,
+            "sentiment":      sentiment,
+            "score_adj":      score_adj,
+        }
+        
+        _v3_cache["news_sentiment"][symbol] = {"value": result, "ts": time.time()}
+        return result
+        
+    except Exception as e:
+        return {"sentiment": "error", "score_adj": 0, "error": str(e), "count": 0}
+
+
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ ENDPOINT'LER - Frontend için                                            │
+# └─────────────────────────────────────────────────────────────────────────┘
+
+@app.get("/api/v3/btc-dominance")
+def btc_dominance_endpoint():
+    """BTC Dominance + Altcoin Season"""
+    try:
+        return {"success": True, "data": get_btc_dominance(), "timestamp": time.time()}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.get("/api/v3/whale/{symbol}")
+def whale_endpoint(symbol: str):
+    """Bir sembolün balina aktivitesi"""
+    try:
+        return {"success": True, "data": get_whale_activity(symbol.upper()), "timestamp": time.time()}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.get("/api/v3/news-sentiment/{symbol}")
+def news_sentiment_endpoint(symbol: str):
+    """Bir sembolün haber sentiment'ı"""
+    try:
+        return {"success": True, "data": get_news_sentiment(symbol.upper()), "timestamp": time.time()}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.get("/api/v3/full-analysis/{symbol}")
+def full_analysis_endpoint(symbol: str):
+    """Bir sembolün TÜM v3.2 analizleri (debug/UI için)"""
+    try:
+        sym = symbol.upper()
+        return {
+            "success": True,
+            "symbol":  sym,
+            "market":          get_market_regime(),
+            "btc_dominance":   get_btc_dominance(),
+            "ma50":            get_ma50(sym),
+            "btc_correlation": get_btc_correlation(sym),
+            "volume_profile":  get_volume_profile(sym),
+            "whale_activity":  get_whale_activity(sym),
+            "news_sentiment":  get_news_sentiment(sym),
+            "timestamp":       time.time(),
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 @app.get("/api/market-regime")
 def market_regime_endpoint():
     """Sistem v3 - Piyasa rejimi endpoint (frontend için)"""
@@ -3464,6 +3788,94 @@ def _scan_for_signals():
                         print(f"[TRACKER] ⚠️ Volume hatası {sym}: {vol_err}", flush=True)
                 
                 # ════════════════════════════════════════════════════════════════
+                # SİSTEM v3.2 - YENİ KURALLAR (16 May 2026)
+                # ════════════════════════════════════════════════════════════════
+                
+                # ════════════════════════════════════════════════════════════════
+                # Kural 11: BTC DOMINANCE FİLTRESİ
+                # ════════════════════════════════════════════════════════════════
+                # BTC dominance > %60 = BTC sezonu, altcoinler zayıf
+                # Sadece major coinler (BTC, ETH) izin ver
+                try:
+                    btc_dom = get_btc_dominance()
+                    if btc_dom["altcoin_state"] == "BTC_SEASON":
+                        # BTC sezonunda sadece BTC ve ETH'ye izin
+                        if sym not in ("BTC", "ETH"):
+                            skipped_adjusted += 1
+                            print(f"[TRACKER] 👑 {sym} BTC sezonu (dom={btc_dom['btc_dominance']}%) → "
+                                  f"sadece BTC/ETH alınır, reddedildi", flush=True)
+                            continue
+                except Exception as dom_err:
+                    print(f"[TRACKER] ⚠️ BTC Dominance hatası: {dom_err}", flush=True)
+                
+                # ════════════════════════════════════════════════════════════════
+                # Kural 12: BALİNA AKTİVİTESİ
+                # ════════════════════════════════════════════════════════════════
+                # Eğer balina aktivitesi "dağıtım" (satış) ise reddet
+                # Eğer "akümülasyon" (alım) ise BONUS puan (sinyal güçlenir)
+                whale_bonus = 0
+                try:
+                    whale = get_whale_activity(sym)
+                    
+                    # Güçlü dağıtım → reddet (balinalar satıyor)
+                    if whale["sentiment"] == "strong_distribution":
+                        skipped_adjusted += 1
+                        print(f"[TRACKER] 🐋 {sym} balinalar BÜYÜK SATIŞ ({whale['net_flow']:.0f}$) → "
+                              f"reddedildi", flush=True)
+                        continue
+                    
+                    # Normal dağıtım + BEAR rejim → reddet
+                    if whale["sentiment"] == "distribution" and market_v3["regime"] in ("BEAR", "EXTREME_BEAR"):
+                        skipped_adjusted += 1
+                        print(f"[TRACKER] 🐋 {sym} balina dağıtım + BEAR → reddedildi", flush=True)
+                        continue
+                    
+                    # Akümülasyon → bonus puan
+                    whale_bonus = whale["score_adj"]
+                    if whale_bonus > 0:
+                        print(f"[TRACKER] 🐋 {sym} balina BONUS: +{whale_bonus} "
+                              f"(sentiment: {whale['sentiment']}, net: ${whale['net_flow']:.0f})", flush=True)
+                except Exception as whale_err:
+                    print(f"[TRACKER] ⚠️ Balina hatası {sym}: {whale_err}", flush=True)
+                
+                # ════════════════════════════════════════════════════════════════
+                # Kural 13: HABER SENTIMENT
+                # ════════════════════════════════════════════════════════════════
+                # Olumsuz haberler varsa reddet (hack, regülasyon, vs.)
+                # Olumlu haberler varsa BONUS puan
+                news_bonus = 0
+                try:
+                    news = get_news_sentiment(sym)
+                    
+                    # Çok olumsuz haber → reddet
+                    if news["sentiment"] == "very_bearish":
+                        skipped_adjusted += 1
+                        print(f"[TRACKER] 📰 {sym} olumsuz haber sentiment ({news['bearish_count']} bearish) → "
+                              f"reddedildi", flush=True)
+                        continue
+                    
+                    # Bearish + SIDEWAYS/BEAR → reddet
+                    if news["sentiment"] == "bearish" and market_v3["regime"] in ("SIDEWAYS", "BEAR", "EXTREME_BEAR"):
+                        skipped_adjusted += 1
+                        print(f"[TRACKER] 📰 {sym} bearish haber + {market_v3['regime']} → reddedildi", flush=True)
+                        continue
+                    
+                    # Olumlu haber → bonus
+                    news_bonus = news["score_adj"]
+                    if news_bonus > 0:
+                        print(f"[TRACKER] 📰 {sym} haber BONUS: +{news_bonus} "
+                              f"(sentiment: {news['sentiment']}, bullish: {news.get('bullish_count', 0)})", flush=True)
+                except Exception as news_err:
+                    print(f"[TRACKER] ⚠️ Haber hatası {sym}: {news_err}", flush=True)
+                
+                # Bonus puanları skora ekle
+                if whale_bonus > 0 or news_bonus > 0:
+                    total_bonus = whale_bonus + news_bonus
+                    print(f"[TRACKER] ⭐ {sym} skor bonus: +{total_bonus} "
+                          f"(balina:{whale_bonus}, haber:{news_bonus}) → {adjusted_score} → {adjusted_score + total_bonus}", flush=True)
+                    adjusted_score = min(99, adjusted_score + total_bonus)
+                
+                # ════════════════════════════════════════════════════════════════
                 
                 # Yeni sinyal ekle (adjusted_score ile)
                 new_sig = {
@@ -3478,6 +3890,9 @@ def _scan_for_signals():
                     "filters":      filter_reasons,    # Hangi filtreler etkiledi
                     "btcTrend":     btc_trend["trend_24h"],
                     "category":     COIN_CATEGORIES.get(sym, "altcoin"),
+                    # v3.2 - Yeni metadata
+                    "whaleBonus":   whale_bonus,
+                    "newsBonus":    news_bonus,
                 }
                 existing.append(new_sig)
                 last_by_sym[sym] = now_ms
