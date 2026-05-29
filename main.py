@@ -4,6 +4,14 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import urllib.request, urllib.parse
+# ── v4 Skor Motoru (paralel test) ──
+try:
+    from v4_integration import compute_v4_for_symbol
+    V4_AVAILABLE = True
+    print("[V4] Skor motoru yüklendi", flush=True)
+except Exception as _v4err:
+    V4_AVAILABLE = False
+    print(f"[V4] Yüklenemedi: {_v4err}", flush=True)
 
 # ── Ortam değişkenleri ────────────────────────────────────────────────────────
 READ_KEY       = os.environ.get("BINANCE_API_KEY", "")
@@ -3386,6 +3394,30 @@ def _check_exits():
     except Exception as e:
         _log_error("Exit kontrolü", e)
 
+def _compute_v4_safe(sym):
+    """v4 skorunu güvenli hesapla. Hata olsa bile None döner, tracker'ı bozmaz."""
+    if not V4_AVAILABLE:
+        return None
+    try:
+        return compute_v4_for_symbol(
+            sym,
+            get_pub=get_pub,
+            futures_base=FUTURES_BASE,
+            get_market_regime=get_market_regime,
+            get_btc_dominance=get_btc_dominance,
+            get_btc_correlation=get_btc_correlation,
+            get_volume_profile=get_volume_profile,
+            get_whale_activity=get_whale_activity,
+            get_news_sentiment=get_news_sentiment,
+            get_btc_trends=get_btc_trends,
+        )
+    except Exception as e:
+        print(f"[V4] {sym} hata: {e}", flush=True)
+        return None
+
+
+def _scan_for_signals():          # ← bu satır zaten var, dokunma
+
 # ── SİNYAL TARAMA — yeni AL fırsatları ─────────────────────────────────────
 def _scan_for_signals():
     """Backend'in /api/signals endpoint'ini çağırır, skor 68+ olanları kaydet."""
@@ -3894,6 +3926,18 @@ def _scan_for_signals():
                     "whaleBonus":   whale_bonus,
                     "newsBonus":    news_bonus,
                 }
+                # ── v4 PARALEL SKOR ──
+                v4 = _compute_v4_safe(sym)
+                if v4:
+                    new_sig["v4_score"]      = v4.get("score", 0)
+                    new_sig["v4_rec"]        = v4.get("rec", "?")
+                    new_sig["v4_vetoed"]     = v4.get("vetoed", False)
+                    new_sig["v4_veto"]       = v4.get("veto_reasons", [])
+                    new_sig["v4_components"] = v4.get("components", {})
+                    new_sig["v4_funding"]    = v4.get("funding_rate")
+                    new_sig["v4_targets"]    = v4.get("targets", {})
+                    print(f"[V4] {sym}: v3={adjusted_score} v4={v4.get('score')} "
+                          f"({v4.get('rec')}{' VETO' if v4.get('vetoed') else ''})", flush=True)
                 existing.append(new_sig)
                 last_by_sym[sym] = now_ms
                 added += 1
@@ -4065,6 +4109,15 @@ def tracker_status():
     state["firebase_error"] = _firebase_init_error
     state["telegram_configured"] = bool(TG_TOKEN and TG_CHAT_ID)
     return state
+@app.get("/api/v4/score/{symbol}")
+def v4_score_endpoint(symbol: str):
+    """Bir coin için canlı v4 skoru + tam döküm."""
+    if not V4_AVAILABLE:
+        return {"success": False, "error": "v4 motoru yüklü değil"}
+    v4 = _compute_v4_safe(symbol.upper())
+    if not v4:
+        return {"success": False, "error": "hesaplanamadı"}
+    return {"success": True, "data": v4, "timestamp": time.time()}
 
 @app.get("/api/tracker/signals")
 def tracker_signals():
