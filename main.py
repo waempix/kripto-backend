@@ -3414,10 +3414,6 @@ def _compute_v4_safe(sym):
     except Exception as e:
         print(f"[V4] {sym} hata: {e}", flush=True)
         return None
-
-
-def _scan_for_signals():          # ← bu satır zaten var, dokunma
-
 # ── SİNYAL TARAMA — yeni AL fırsatları ─────────────────────────────────────
 def _scan_for_signals():
     """Backend'in /api/signals endpoint'ini çağırır, skor 68+ olanları kaydet."""
