@@ -469,6 +469,9 @@ def compute_dynamic_targets(price, atr, side="BUY"):
     sl  = price - 1.5 * atr
     tp1 = price + 2.0 * atr
     tp2 = price + 3.5 * atr
+    if (price - sl)  / price * 100 < 1.5: sl  = price * 0.985
+    if (tp1 - price) / price * 100 < 2.5: tp1 = price * 1.025
+    if (tp2 - price) / price * 100 < 5.0: tp2 = price * 1.050
     return {
         "sl": sl, "tp1": tp1, "tp2": tp2,
         "sl_pct":  round((price - sl) / price * 100, 2),
