@@ -6,12 +6,13 @@ from pydantic import BaseModel
 import urllib.request, urllib.parse
 # ── v4 Skor Motoru (paralel test) ──
 try:
-    from v4_integration import compute_v4_for_symbol
+    from v4_integration import compute_v4_for_symbol, compute_v4_short_for_symbol
     V4_AVAILABLE = True
     print("[V4] Skor motoru yüklendi", flush=True)
 except Exception as _v4err:
     V4_AVAILABLE = False
     print(f"[V4] Yüklenemedi: {_v4err}", flush=True)
+    
 
 # ── Ortam değişkenleri ────────────────────────────────────────────────────────
 READ_KEY       = os.environ.get("BINANCE_API_KEY", "")
