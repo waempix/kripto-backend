@@ -3415,6 +3415,121 @@ def _compute_v4_safe(sym):
     except Exception as e:
         print(f"[V4] {sym} hata: {e}", flush=True)
         return None
+ def _compute_v4_short_safe(sym):
+    """v4-SHORT skoru. ⚠️ PAPER. Hata olsa None döner."""
+    if not V4_AVAILABLE:
+        return None
+    try:
+        return compute_v4_short_for_symbol(
+            sym, get_pub=get_pub, futures_base=FUTURES_BASE,
+            get_market_regime=get_market_regime, get_btc_dominance=get_btc_dominance,
+            get_btc_correlation=get_btc_correlation, get_volume_profile=get_volume_profile,
+            get_whale_activity=get_whale_activity, get_news_sentiment=get_news_sentiment,
+            get_btc_trends=get_btc_trends,
+        )
+    except Exception as e:
+        print(f"[V4-SHORT] {sym} hata: {e}", flush=True)
+        return None
+
+
+_v4_short_cooldown = {}
+
+def _v4_short_shadow_scan():
+    """Bear/sideways'te SHORT paper sinyalleri üretir, ayrı Firebase tablosuna yazar."""
+    if not V4_AVAILABLE:
+        return
+    try:
+        market = get_market_regime()
+        if market.get("regime") == "BULL":
+            return
+        now_ms = int(time.time() * 1000)
+        STATIC = ["BTC","ETH","BNB","SOL","XRP","AVAX","NEAR","SUI","INJ","APT",
+                  "ARB","OP","STRK","POL","LINK","AAVE","HYPE","PENDLE","JUP","UNI",
+                  "TAO","RENDER","FET","WLD","IMX","DOGE","PEPE","BONK","SHIB"]
+        gainers = [g["sym"] for g in _tracker_state.get("gainer_symbols", [])]
+        scan = list(dict.fromkeys(STATIC + gainers))
+        db = _init_firebase()
+        if not db:
+            return
+        doc_ref = db.collection("users").document("user_main")
+        snap = doc_ref.get()
+        data = snap.to_dict() or {}
+        shadow = data.get("v4ShortShadow", []) or []
+        last_by = {}
+        for s in shadow:
+            sy = s.get("sym"); ts = s.get("ts", 0)
+            if sy and ts > last_by.get(sy, 0):
+                last_by[sy] = ts
+        added = 0
+        for sym in scan:
+            if now_ms - last_by.get(sym, 0) < 48*3600*1000:
+                continue
+            v4s = _compute_v4_short_safe(sym)
+            if not v4s or v4s.get("vetoed") or v4s.get("score", 0) < 72:
+                continue
+            t = v4s.get("targets", {})
+            shadow.append({
+                "sym": sym, "score": v4s["score"], "rec": "SHORT",
+                "entry": v4s.get("price", 0), "ts": now_ms, "verified": False,
+                "components": v4s.get("components", {}),
+                "funding": v4s.get("funding_rate"),
+                "sl_pct": t.get("sl_pct"), "tp1_pct": t.get("tp1_pct"), "tp2_pct": t.get("tp2_pct"),
+            })
+            added += 1
+            print(f"[V4-SHORT] 📉 {sym} SHORT paper sinyal: skor {v4s['score']}", flush=True)
+        if added:
+            cutoff = now_ms - 30*24*3600*1000
+            shadow = [s for s in shadow if s.get("ts",0) > cutoff][-500:]
+            doc_ref.set({"v4ShortShadow": shadow}, merge=True)
+            print(f"[V4-SHORT] {added} yeni short paper sinyal kaydedildi", flush=True)
+    except Exception as e:
+        print(f"[V4-SHORT] tarama hata: {e}", flush=True)
+
+
+def _v4_short_check_exits():
+    """SHORT paper exit kontrolü. Fiyat DÜŞERSE kâr, YÜKSELİRSE zarar."""
+    if not V4_AVAILABLE:
+        return
+    try:
+        db = _init_firebase()
+        if not db:
+            return
+        doc_ref = db.collection("users").document("user_main")
+        snap = doc_ref.get()
+        data = snap.to_dict() or {}
+        shadow = data.get("v4ShortShadow", []) or []
+        if not shadow:
+            return
+        prices = _get_current_prices()
+        now_ms = int(time.time() * 1000)
+        changed = False
+        for h in shadow:
+            if h.get("verified"):
+                continue
+            sym = h.get("sym"); entry = h.get("entry", 0); ts = h.get("ts", 0)
+            if not entry or entry <= 0:
+                continue
+            cur = prices.get(sym)
+            if cur is None:
+                continue
+            pct = (entry - cur) / entry * 100
+            age_h = (now_ms - ts) / 3600000
+            sl = h.get("sl_pct", 5.0); tp2 = h.get("tp2_pct", 10.0)
+            reason = None
+            if pct <= -sl:        reason = "SL"
+            elif pct >= tp2:      reason = "TP2"
+            elif age_h >= 48:     reason = "TIME"
+            if reason:
+                h["exit"] = cur; h["change"] = round(pct, 2)
+                h["success"] = pct > 0; h["verified"] = True
+                h["exitReason"] = reason; h["holdHours"] = round(age_h)
+                changed = True
+                emoji = "✅" if pct > 0 else "❌"
+                _tg_notify(f"{emoji} [SHORT PAPER] {sym} kapandı: {reason} {pct:+.2f}%")
+        if changed:
+            doc_ref.set({"v4ShortShadow": shadow}, merge=True)
+    except Exception as e:
+        print(f"[V4-SHORT] exit hata: {e}", flush=True)       
 # ── SİNYAL TARAMA — yeni AL fırsatları ─────────────────────────────────────
 def _scan_for_signals():
     """Backend'in /api/signals endpoint'ini çağırır, skor 68+ olanları kaydet."""
