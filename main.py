@@ -3415,8 +3415,8 @@ def _compute_v4_safe(sym):
     except Exception as e:
         print(f"[V4] {sym} hata: {e}", flush=True)
         return None
- def _compute_v4_short_safe(sym):
-    """v4-SHORT skoru. ⚠️ PAPER. Hata olsa None döner."""
+def _compute_v4_short_safe(sym):
+    """v4-SHORT skoru. PAPER. Hata olsa None doner."""
     if not V4_AVAILABLE:
         return None
     try:
