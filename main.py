@@ -4178,10 +4178,11 @@ def _tracker_loop():
 
             # Her 30 saniyede exit check
             _check_exits()
-
+            _v4_short_check_exits()
             # Her 5 dakikada scan
             if now - last_scan >= SCAN_INTERVAL:
                 _scan_for_signals()
+                _v4_short_shadow_scan()
                 last_scan = now
 
             time.sleep(EXIT_INTERVAL)
