@@ -4231,6 +4231,49 @@ def v4_score_endpoint(symbol: str):
     if not v4:
         return {"success": False, "error": "hesaplanamadı"}
     return {"success": True, "data": v4, "timestamp": time.time()}
+@app.get("/api/v4short/score/{symbol}")
+def v4short_score_endpoint(symbol: str):
+    """Tek coin icin v4-SHORT skoru (canli test). PAPER."""
+    if not V4_AVAILABLE:
+        return {"success": False, "error": "v4 motor yuklenmedi"}
+    r = _compute_v4_short_safe(symbol)
+    if r is None:
+        return {"success": False, "error": "hesaplanamadi"}
+    return {"success": True, "data": r}
+
+
+@app.get("/api/v4short/stats")
+def v4short_stats_endpoint():
+    """SHORT paper sinyal istatistikleri: isabet orani, ortalama getiri."""
+    try:
+        db = _init_firebase()
+        if not db:
+            return {"success": False, "error": "firebase yok"}
+        snap = db.collection("users").document("user_main").get()
+        data = snap.to_dict() or {}
+        shadow = data.get("v4ShortShadow", []) or []
+        verified = [s for s in shadow if s.get("verified")]
+        wins = [s for s in verified if s.get("success")]
+        n = len(verified)
+        win_rate = round(len(wins) / n * 100, 1) if n else 0
+        avg_change = round(sum(s.get("change", 0) for s in verified) / n, 2) if n else 0
+        net = round(sum(s.get("change", 0) for s in verified), 2)
+        open_signals = [s for s in shadow if not s.get("verified")]
+        return {
+            "success": True,
+            "total_signals": len(shadow),
+            "verified": n,
+            "open": len(open_signals),
+            "wins": len(wins),
+            "losses": n - len(wins),
+            "win_rate": win_rate,
+            "avg_change": avg_change,
+            "net_change": net,
+            "last_signals": sorted(verified, key=lambda x: x.get("ts", 0), reverse=True)[:20],
+            "open_list": sorted(open_signals, key=lambda x: x.get("ts", 0), reverse=True),
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)[:200]}    
 
 @app.get("/api/tracker/signals")
 def tracker_signals():
